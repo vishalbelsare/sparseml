@@ -16,29 +16,28 @@
 """
 To implement an integration-specific set of integrations tests 4 components are needed:
 
-A. {Integration_name}_args.py file containing pydantic classes for the args of each of 
-    the commands (i.e. train, export, deploy).
+- {Integration_name}_args.py file containing pydantic classes for the args of each of
+the commands (i.e. train, export, deploy).
 
-B. {Integration_name}_tester.py file containing integration testing class inherited 
-    from BaseIntegrationTester
+- {Integration_name}_tester.py file containing integration testing class inherited
+from BaseIntegrationTester
 
-C. Tests to run after commands are run. Tests should be implemented in the tester class
-    described in B and should be decorated by @skip_inactive_stage found in helpers.py
+- Tests to run after commands are run. Tests should be implemented in the tester class
+described in B and should be decorated by @skip_inactive_stage found in helpers.py
 
-D. .yaml file for each scenario to run
+- .yaml file for each scenario to run
 """
 
 import os
-import shutil
 import subprocess
-from multiprocessing.sharedctypes import Value
-from typing import Dict, List, Tuple, Union
+from time import sleep
+from typing import Dict, List, Union
 
 import pytest
 import yaml
 from pydantic import BaseModel
 
-from tests.integrations.helpers import get_configs_with_cadence
+from tests.integrations.helpers import stream_process
 
 
 class BaseIntegrationTester:
@@ -81,12 +80,11 @@ class BaseIntegrationTester:
 
     @pytest.fixture(
         scope="class",
-        # Iterate over configs with the matching cadence (default commit)
-        params=get_configs_with_cadence(os.environ.get("NM_TEST_CADENCE", "commit"), os.path.dirname(__file__)),
+        autouse="true",
     )
     def setup(self, request):
+        self = request.cls
 
-        # A path to the current config file
         config_path = request.param
         with open(config_path) as f:
             raw_config = yaml.safe_load(f)
@@ -118,24 +116,24 @@ class BaseIntegrationTester:
             _type: config["test_args"] for _type, config in raw_config.items()
         }
 
-        # Combine pre-args, command stubs, and args into complete CLI commands
-        self.commands = self.compose_command_scripts(self.configs)
-
         # Capture any pre-run information that may be needed for post-run testing
-        self.capture_pre_run_state()
+        self.capture_pre_run_state(self)
+
+        # Combine pre-args, command stubs, and args into complete CLI commands
+        self.commands = self.compose_command_scripts(
+            self.configs, self.command_stubs_final
+        )
 
         # All commands are run sequentially
-        self.run_commands()
+        self.run_commands(self)
 
-        yield  # all tests are run here
+        yield
 
         # Clean up environment after testing is complete
-        self.teardown()
+        self.teardown(self)
 
         # Check for successful teardown
-        self.check_teardown()
-
-        self.check_file_creation()
+        self.teardown_check(self)
 
     @classmethod
     def get_root_commands(cls, configs: Dict[str, Union[str, BaseModel]]):
@@ -149,7 +147,10 @@ class BaseIntegrationTester:
         """
         return cls.command_stubs
 
-    def compose_command_scripts(self, configs: Dict[str, BaseModel]):
+    @classmethod
+    def compose_command_scripts(
+        cls, configs: Dict[str, BaseModel], command_stubs: Dict[str, str]
+    ):
         """
         For each command, create the full CLI command by combining the pre-args,
         command stub, and run args.
@@ -160,10 +161,10 @@ class BaseIntegrationTester:
         """
         commands = {}
         for _type, config in configs.items():
-            if _type not in self.command_stubs:
+            if _type not in cls.command_stubs:
                 raise ValueError(f"{_type} is not a valid command type")
-            commands[_type] = self.create_command_script(
-                config["pre_args"], self.command_stubs_final[_type], config["args"]
+            commands[_type] = cls.create_command_script(
+                config["pre_args"], command_stubs[_type], config["args"]
             )
         return commands
 
@@ -183,29 +184,29 @@ class BaseIntegrationTester:
         args_dict = config.dict()
         args_string_list = []
         for key, value in args_dict.items():
+            key = "--" + key.replace("_", "-")
             # Handles bool type args (e.g. --do-train)
             if isinstance(value, bool):
                 if value:
-                    args_string_list.append("--" + str(key))
-            # Handles args that are both bool and value based
-            elif isinstance(value, Tuple):
-                if not isinstance(value[0], bool):
-                    raise ValueError(
-                        "Tuple types are used to specify bool args with "
-                        "a defined const value. {value} does not qualify"
-                    )
-                if value:
-                    args_string_list.append("--" + key + " " + str(value[1]))
-            # Handles args that have multiple values after the keyword.
-            # e.g. --freeze-layers 0 10 15
+                    args_string_list.append(key)
             elif isinstance(value, List):
-                args_string_list.append("--" + key + " ".join(map(str, value)))
+                # Handles args that are both bool and value based (see evolve in yolov5)
+                if isinstance(value[0], bool):
+                    if value[0]:
+                        args_string_list.extend([key, str(value[1])])
+                # Handles args that have multiple values after the keyword.
+                # e.g. --freeze-layers 0 10 15
+                else:
+                    args_string_list.append(key)
+                    args_string_list.extend(map(str, value))
             # Handles the most straightforward case of keyword followed by value
             # e.g. --epochs 30
             else:
-                args_string_list.append("--" + key + " " + str(value))
-        args_string_combined = " ".join(args_string_list)
-        return " ".join([pre_args, command_stub, args_string_combined])
+                if value is None:
+                    continue
+                args_string_list.extend([key, str(value)])
+        pre_args = pre_args.split(" ") if pre_args else []
+        return pre_args + [command_stub] + args_string_list
 
     def capture_pre_run_state(self):
         """
@@ -220,12 +221,34 @@ class BaseIntegrationTester:
         :param kwargs_dict: dict mapping command type to subprocess.call() kwargs
             to be used with the command, if any
         """
+        ## Debug only code
+        self.commands["train"] = [
+            "/home/konstantin/Source/sparseml/dev-venv/bin/python3.8",
+            "/home/konstantin/Source/sparseml/src/sparseml/pytorch/object_detection/train.py",
+        ] + self.commands["train"][1:]
+        self.commands["export"] = [
+            "/home/konstantin/Source/sparseml/dev-venv/bin/python3.8",
+            "/home/konstantin/Source/sparseml/src/sparseml/pytorch/object_detection/export.py",
+        ] + self.commands["export"][1:]
+
         if not kwargs_dict:
             kwargs_dict = {key: {} for key in self.command_types}
         for _type in self.command_types:
             # Optionally, save intermediate state variables between stages
-            self.save_stage_information(_type)
-            subprocess.call(self.commands[_type], **kwargs_dict[_type])
+            self.save_stage_information(self, _type)
+            """
+            process = subprocess.Popen(self.commands[_type], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            while stream_process(process):
+                sleep(0.1)
+            """
+            try:
+                subprocess.check_output(self.commands[_type], **kwargs_dict[_type])
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(
+                    "command '{}' return with error (code {}): {}".format(
+                        e.cmd, e.returncode, e.output
+                    )
+                )
 
     def save_stage_information(self, command_type):
         """
@@ -236,19 +259,18 @@ class BaseIntegrationTester:
     def teardown(self):
         """
         Cleanup environment after test completion
-        NOTE: Generalized directory deletion logic will go here
         """
-        pass
+        raise NotImplementedError
 
     def teardown_check(self):
         """
-        Check for successful environment cleanup. Logic to be fleshed out
+        Check for successful environment cleanup.
         """
-        self.check_file_creation()
+        pass
 
     def check_file_creation(self, dir):
         """
-        Check whether files have been created during the run. Logic to be fleshed out
+        Check whether files have been created during the run.
         TODO: Move to universal fixtures file?
         """
         self._end_file_count = sum(len(files) for _, _, files in os.walk(r"."))
