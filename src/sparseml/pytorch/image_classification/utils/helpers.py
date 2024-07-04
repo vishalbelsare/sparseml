@@ -19,8 +19,9 @@ Helper methods for image classification/detection based tasks
 import logging
 import os
 import warnings
-from contextlib import contextmanager
+from contextlib import nullcontext
 from enum import Enum, auto, unique
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -33,6 +34,7 @@ from sparseml.pytorch.datasets import DatasetRegistry
 from sparseml.pytorch.datasets.image_classification.ffcv_dataset import (
     FFCVCompatibleDataset,
 )
+from sparseml.pytorch.image_classification.utils.constants import AVAILABLE_DATASETS
 from sparseml.pytorch.models import ModelRegistry
 from sparseml.pytorch.optim import ScheduledModifierManager
 from sparseml.pytorch.utils import (
@@ -44,14 +46,19 @@ from sparseml.pytorch.utils import (
     TensorBoardLogger,
     TopKAccuracy,
     default_device,
+    download_framework_model_by_recipe_type,
     early_stop_data_loader,
+    load_model,
     model_to_device,
     set_deterministic_seeds,
     torch_distributed_zero_first,
 )
 from sparseml.utils import create_dirs
-from sparsezoo import Zoo
+from sparseml.utils.datasets import cifar, imagenet, imagenette
+from sparsezoo import Model, setup_model
 
+
+_LOGGER = logging.getLogger(__name__)
 
 __all__ = [
     "Tasks",
@@ -60,11 +67,62 @@ __all__ = [
     "create_model",
     "infer_num_classes",
     "save_model_training",
+    "write_validation_results",
     "set_seeds",
     "get_loss_wrapper",
     "ddp_aware_model_move",
     "extract_metadata",
+    "save_zoo_directory",
+    "label_to_class_mapping_from_dataset",
 ]
+
+
+def save_zoo_directory(
+    output_dir: str, training_outputs_dir: str, logs_path: Optional[str] = None
+):
+    """
+    Takes the `training_outputs_dir`
+    (the directory where the pipeline saves its training artifacts),
+    and saves the training artifacts to `output_dir` as a sparsezoo Model class object.
+
+    :param output_dir: The output path where the artifacts are saved
+        (adhering to the structure of sparsezoo Model class object)
+    :param training_outputs_dir: The path to the existing directory
+        with the saved training artifacts
+    :param logs_path: Optional directory where the training logs reside
+    """
+    for root_file in [
+        "model.onnx",
+        "sample-inputs",
+        "sample-outputs",
+        "sample-labels",
+        "deployment",
+    ]:
+        root_file_path = os.path.join(training_outputs_dir, root_file)
+        if not os.path.exists(root_file_path):
+            raise ValueError(
+                f"File {root_file_path} missing. To create this file, "
+                "make sure that the `export` script (for exporting image "
+                "classification models) has been evoked."
+            )
+
+    setup_model(
+        output_dir=output_dir,
+        training=os.path.join(training_outputs_dir, "training"),
+        deployment=os.path.join(training_outputs_dir, "deployment"),
+        onnx_model=os.path.join(training_outputs_dir, "model.onnx"),
+        sample_inputs=os.path.join(training_outputs_dir, "sample-inputs"),
+        sample_outputs=os.path.join(training_outputs_dir, "sample-outputs"),
+        sample_labels=os.path.join(training_outputs_dir, "sample-labels"),
+        model_card=os.path.join(training_outputs_dir, "model.md"),
+        logs=logs_path,
+        sample_originals=None,
+        analysis=None,
+        benchmarks=None,
+        eval_results=None,
+        recipes=None,
+    )
+    _LOGGER.info(f"Created sparsezoo Model directory locally in {output_dir}")
 
 
 @unique
@@ -108,9 +166,13 @@ def get_save_dir_and_loggers(
             if task == Tasks.TRAIN
             else None
         )
-
+        arch_key_save_name = f"{arch_key.replace('/', '.')}"
         if not model_tag:
-            model_tag = f"{arch_key.replace('/', '.')}_{dataset_name}"
+            model_tag = (
+                f"{arch_key_save_name}_{dataset_name}"
+                if dataset_name
+                else arch_key_save_name
+            )
             model_id = model_tag
             model_inc = 0
             # set location to check for models with same name
@@ -147,6 +209,26 @@ def get_save_dir_and_loggers(
 
 
 # data helpers
+def label_to_class_mapping_from_dataset(dataset: str) -> Optional[Dict[int, str]]:
+    """
+    Retrieve the label-to-class-mapping for the chosen dataset
+    If dataset is not recognized, returns None
+
+    :param dataset: string identifier of the dataset (e.g. "imagenet")
+    :return: mapping from labels to class strings if found. Otherwise None
+    """
+    if dataset not in AVAILABLE_DATASETS:
+        _LOGGER.warning(f"Dataset: {dataset} not recognized.")
+        return None
+    else:
+        if dataset == "cifar":
+            return cifar.CIFAR_10_CLASSES
+        elif dataset == "imagenette":
+            return imagenette.IMAGENETTE_CLASSES
+        else:
+            return imagenet.IMAGENET_CLASSES
+
+
 def get_dataset_and_dataloader(
     dataset_name: str,
     dataset_path: str,
@@ -182,19 +264,42 @@ def get_dataset_and_dataloader(
     download_context = (
         torch_distributed_zero_first(local_rank)  # only download once locally
         if training
-        else _nullcontext()
+        else nullcontext()
     )
     dataset_kwargs = dataset_kwargs or {}
 
     with download_context:
-        dataset = DatasetRegistry.create(
-            dataset_name,
-            root=dataset_path,
-            train=training,
-            rand_trans=training,
-            image_size=image_size,
-            **dataset_kwargs,
-        )
+        try:
+            dataset = DatasetRegistry.create(
+                key=dataset_name,
+                root=dataset_path,
+                train=training,
+                rand_trans=training,
+                image_size=image_size,
+                **dataset_kwargs,
+            )
+        except Exception as registry_exception:
+            if dataset_name == "imagefolder" and (
+                dataset_path in DatasetRegistry.registered_datasets()
+            ):
+                # user attempting to run imagefolder of pre-supported
+                # dataset, without a local copy,
+                # use the dataset_path as registry key instead to attempt
+                # auto download
+                dataset = DatasetRegistry.create(
+                    key=dataset_path,
+                    train=training,
+                    rand_trans=training,
+                    image_size=image_size,
+                    **dataset_kwargs,
+                )
+                # still treated as image folder dataset, so num_classes attr
+                # should be set at the object level instead of registry
+                dataset.num_classes = DatasetRegistry.attributes(dataset_path).get(
+                    "num_classes"
+                )
+            else:
+                raise registry_exception
 
     sampler = (
         torch.utils.data.distributed.DistributedSampler(dataset)
@@ -246,9 +351,11 @@ def create_model(
     arch_key: Optional[str] = None,
     pretrained: Union[bool, str] = False,
     pretrained_dataset: Optional[str] = None,
+    one_shot: Optional[str] = None,
     local_rank: int = -1,
-    **model_kwargs,
-) -> Tuple[Module, str]:
+    model_kwargs: Optional[Dict[str, Any]] = None,
+    **kwargs,
+) -> Tuple[Module, str, str]:
     """
     :param checkpoint_path: Path to the checkpoint to load. `zoo` for
         downloading weights with respect to a SparseZoo recipe
@@ -261,16 +368,28 @@ def create_model(
         False
     :param pretrained_dataset: The dataset to used for pretraining. Defaults to
         None
+    :param one_shot: The recipe to be applied in one-shot manner,
+        before exporting. Defaults to None
     :param local_rank: The local rank of the process. Defaults to -1
     :param model_kwargs: Additional keyword arguments to pass to the model
     :returns: A tuple containing the mode, the model's arch_key, and the
         checkpoint path
     """
+    model_kwargs = model_kwargs or {}
     with torch_distributed_zero_first(local_rank):
         # only download once locally
-        if checkpoint_path and checkpoint_path.lower() == "zoo":
+        if checkpoint_path and checkpoint_path.startswith("zoo"):
+            recipe_type = None
+            if recipe_path and "recipe_type=" in recipe_path:
+                # override recipe type from recipe path
+                recipe_type = recipe_path.split("recipe_type=")[1]
+                recipe_type = recipe_type.split("&")[0]
+
+            if checkpoint_path.lower() == "zoo":
+                checkpoint_path = recipe_path
+
             checkpoint_path = _download_model_from_zoo_using_recipe(
-                recipe_stub=recipe_path,
+                recipe_stub=checkpoint_path, recipe_type=recipe_type
             )
 
         result = ModelRegistry.create(
@@ -286,6 +405,16 @@ def create_model(
             model, arch_key = result, arch_key
         else:
             model, arch_key = result
+
+        # TODO: discuss how this is related to the above application of recipes
+        if recipe_path is not None:
+            # TODO: replace this with a new manager introduced by @satrat
+            ScheduledModifierManager.from_yaml(recipe_path).apply_structure(model)
+            if checkpoint_path:
+                load_model(checkpoint_path, model, strict=True)
+
+        if one_shot is not None:
+            ScheduledModifierManager.from_yaml(file_path=one_shot).apply(module=model)
 
         return model, arch_key, checkpoint_path
 
@@ -353,7 +482,7 @@ def save_model_training(
     manager: BaseManager,
     save_name: str,
     save_dir: str,
-    epoch: int,
+    epoch: Optional[int],
     val_res: Optional[ModuleRunResults],
     checkpoint_manager: Optional[BaseManager] = None,
     arch_key: Optional[str] = None,
@@ -364,7 +493,7 @@ def save_model_training(
     :param manager: manager created from the training recipe
     :param save_name: name to save model to
     :param save_dir: directory to save results in
-    :param epoch: integer representing umber of epochs to
+    :param epoch: integer representing epoch at which model is saved at
     :param val_res: results from validation run
     :param checkpoint_manager: manager created from the checkpoint recipe
     :param arch_key: if provided, the `arch_key` will be saved in the
@@ -397,21 +526,34 @@ def save_model_training(
         name=f"{save_name}.pth",
         arch_key=arch_key,
     )
-    info_path = os.path.join(save_dir, f"{save_name}.txt")
 
+    info_path = os.path.join(save_dir, f"{save_name}.txt")
+    write_validation_results(info_path, val_res, epoch=epoch)
+
+    if not save_message_shown:
+        print(f"Saving model for epoch {epoch} to {save_dir} for {save_name}")
+
+
+def write_validation_results(
+    info_path: str, val_res: ModuleRunResults, epoch: Optional[int] = None
+):
+    """
+    :param: file path to save results to
+    :param: results from validation run
+    :param: epoch number of validation run
+    """
     with open(info_path, "w") as info_file:
-        info_lines = [
-            f"epoch: {epoch}",
-        ]
+        info_lines = []
+
+        if epoch is not None:
+            info_lines.append(f"epoch: {epoch}")
 
         if val_res is not None:
             for loss in val_res.results.keys():
                 info_lines.append(f"{loss}: {val_res.result_mean(loss).item()}")
 
         info_file.write("\n".join(info_lines))
-
-    if not save_message_shown:
-        print(f"Saving model for epoch {epoch} " f"to {save_dir} for {save_name}")
+        _LOGGER.info(f"Saving validation results to {info_path}")
 
 
 def set_seeds(local_rank: int):
@@ -496,12 +638,14 @@ def extract_metadata(
 
 def _download_model_from_zoo_using_recipe(
     recipe_stub: str,
+    recipe_type: Optional[str],
 ) -> Optional[str]:
     """
     Download a model from the zoo using a recipe stub and return the
     path to the downloaded model.
 
     :param recipe_stub: Path to a valid recipe stub
+    :param recipe_type: recipe type override in zoo stub
     :return: Path to the downloaded model
     """
     valid_recipe_stub = recipe_stub and recipe_stub.startswith("zoo:")
@@ -512,19 +656,49 @@ def _download_model_from_zoo_using_recipe(
             f" but got {recipe_stub} instead"
         )
 
-    files = Zoo.download_recipe_base_framework_files(
-        stub=recipe_stub,
-        extensions=[".pth"],
+    return download_framework_model_by_recipe_type(
+        Model(recipe_stub),
+        recipe_name=recipe_type,
     )
 
-    checkpoint_path = files[0]
-    return checkpoint_path
+
+def is_image_classification_model(source_path: Union[Path, str]) -> bool:
+    """
+    :param source_path: The path to the model
+    :return: Whether the model is an image classification model or not
+    """
+
+    if not os.path.isfile(source_path):
+        checkpoint_path = os.path.join(source_path, "model.pth")
+    else:
+        checkpoint_path = source_path
+    try:
+        if torch.cuda.is_available():
+            checkpoint = torch.load(checkpoint_path)
+        else:
+            checkpoint = torch.load(checkpoint_path, map_location=torch.device("cpu"))
+
+        arch_key = checkpoint.get("arch_key")
+        if arch_key:
+            return True
+    except Exception as e:
+        _LOGGER.debug(
+            f"Model: {checkpoint_path} not an image classification model: {e}"
+        )
+        return False
 
 
-@contextmanager
-def _nullcontext(enter_result=None):
-    """
-    A context manager that does nothing. For compatibility with Python 3.6
-    Update usages to use contextlib.nullcontext on Python 3.7+
-    """
-    yield enter_result
+def _validate_dataset_num_classes(
+    dataset: str,
+    dataset_path: str,
+    num_classes: int,
+):
+    if dataset and not dataset_path:
+        raise ValueError(f"found dataset {dataset} but dataset_path not specified")
+    if dataset_path and not dataset:
+        raise ValueError(f"found dataset_path {dataset_path} but dataset not specified")
+    if num_classes is None and (not dataset or not dataset_path):
+        raise ValueError(
+            "If num_classes is not provided, both dataset and dataset_path must be "
+            "set to infer num_classes"
+        )

@@ -14,81 +14,170 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# SparseML Ultralytics YOLOv5 Integration
+# SparseML YOLOv5 Integration
 
-This directory combines the SparseML recipe-driven approach with the 
-[ultralytics/yolov5](https://github.com/ultralytics/yolov5) repository.
-By integrating the robust training flows in the `yolov5` repository with the SparseML code base,
-we enable model sparsification techniques on the popular [YOLOv5 architecture](https://github.com/ultralytics/yolov5/issues/280)
-creating smaller and faster deployable versions.
-The techniques include, but are not limited to:
-- Pruning
-- Quantization
-- Pruning + Quantization
-- Sparse Transfer Learning
+This directory explains how to use SparseML's `ultralytics/yolov5` integration to train inference-optimized sparse YOLOv5 models on your dataset.
 
-## Highlights
+There are two main workflows enabled by SparseML:
+- **Sparse Transfer Learning** - fine-tune a pre-sparsified YOLOv5 checkpoint on your own dataset **[RECOMMENDED]**
+- **Sparsification from Scratch** - apply pruning and quantization to sparsify any YOLOv5 model from scratch
 
-- Example: [DeepSparse YOLOv5 Inference Example](https://github.com/neuralmagic/deepsparse/tree/main/examples/ultralytics-yolo)
-
-## Tutorials
-
-- [Sparsifying YOLOv5 Using Recipes](https://github.com/neuralmagic/sparseml/blob/main/integrations/ultralytics-yolov5/tutorials/sparsifying_yolov5_using_recipes.md)
-- [Sparse Transfer Learning With YOLOv5](https://github.com/neuralmagic/sparseml/blob/main/integrations/ultralytics-yolov5/tutorials/yolov5_sparse_transfer_learning.md)
+Once trained, SparseML enables you to export models to the ONNX format, such that they can be deployed with DeepSparse.
 
 ## Installation
 
-To begin, run the following command in the root directory of this integration (`cd integrations/ultralytics-yolov5`):
+Install with `pip`:
+
 ```bash
-bash setup_integration.sh
+pip install sparseml[yolov5]
 ```
 
-The setup_integration.sh file will clone the yolov5 repository with the SparseML integration as a subfolder.
-After the repo has successfully cloned,  all dependencies from the `yolov5/requirements.txt` file will install in your current environment.
-Note, the `yolov5` repository requires Python 3.7 or greater.
+## Tutorials
+
+- [Sparse Transfer Learning with the CLI](tutorials/sparse-transfer-learning.md) **[HIGHLY RECOMMENDED]**
+- [Sparsifying From Scratch with the CLI](tutorials/sparsify-from-scratch.md)
 
 ## Quick Tour
 
-### Recipes
-
-Recipes encode the instructions and hyperparameters for sparsifying a model using modifiers to the training process.
-The modifiers can range from pruning and quantization to learning rate and weight decay.
-When appropriately combined, it becomes possible to create highly sparse and accurate models.
-
-This integration adds a `--recipe` argument to the [`train.py` script](https://github.com/neuralmagic/yolov5/blob/master/train.py).
-The argument loads an appropriate recipe while preserving the rest of the training pipeline.
-Popular recipes used with this argument are found in the [`recipes` folder](./recipes).
-Otherwise, all other arguments and functionality remain the same as the original repository.
-
 ### SparseZoo
 
-Neural Magic’s ML team creates sparsified models that allow anyone to plug in their data and leverage pre-sparsified models from the SparseZoo.
-Select a yolov5 model from the [SparseZoo](https://sparsezoo.neuralmagic.com/?repo=ultralytics&page=1).
+SparseZoo is an open-source repository of pre-sparsified models, including each version of of YOLOv5. With SparseML, you can fine-tune these pre-sparsified checkpoints onto custom datasets (while maintaining sparsity) via sparse transfer learning. This makes training inference-optimized sparse models almost identical to your typical YOLOv5 training workflow.
 
-### Structure
+[Check out the available models](https://sparsezoo.neuralmagic.com/?repo=ultralytics&page=1)
 
-The following table lays out the root-level files and folders along with a description for each.
+### Recipes
 
-| Folder/File Name     | Description                                                                                                           |
-|----------------------|-----------------------------------------------------------------------------------------------------------------------|
-| data                 | The hyperparameters to use and files to use for training on data.                                                     |
-| models               | Model architecture definitions along with any downloaded checkpoints from the SparseZoo.                              |
-| recipes              | Typical recipes for sparsifying YOLOv5 models along with any downloaded recipes from the SparseZoo.                   |
-| tutorials            | Tutorial walkthroughs for how to sparsify YOLOv5 models using recipes.                                                |
-| yolov5               | Integration repository folder used to train and sparsify YOLOv5 models (setup_integration.sh must run first).         |
-| README.md            | Readme file.                                                                                                          |
-| setup_integration.sh | Setup file for the integration run from the command line.                                                             |
+Recipes are YAML files that encode the instructions for sparsifying a model or sparse transfer learning. SparseML accepts the recipes as inputs, parses the instructions, and applies the specified algorithms and hyperparameters during the training process.
 
-### Exporting for Inference
+In this way, recipes are the declarative interface for specifying which sparsity-related algorithms to apply, allowing you to apply sparsity related algorithms from the familiar YOLOv5 training script.
 
-After sparsifying a model, the [`export.py` script](https://github.com/neuralmagic/yolov5/blob/master/models/export.py) 
-converts the model into deployment formats such as [ONNX](https://onnx.ai/).
-The export process is modified such that the quantized and pruned models are corrected and folded properly.
+### SparseML CLI
 
-For example, the following command can be run from within the yolov5 repository folder to export a trained/sparsified model's checkpoint:
+SparseML's CLI is built on top of YOLOv5's [`train.py`](https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data) script. This enables you to kick-off sparse training workflows with all of the friendly utilities from the friendly Ultralytics repo like dataset loading and preprocessing, checkpoint saving, metric reporting, and logging handled for you. Appending the `--help` argument will provide a full list of options for training in SparseML:
+
 ```bash
-python models/export.py --weights PATH/TO/weights.pt --dynamic
+sparseml.yolov5.train --help
 ```
 
-The DeepSparse Engine accepts ONNX formats and is engineered to significantly speed up inference on CPUs for the sparsified models from this integration.
-Examples for loading, benchmarking, and deploying can be found in the [DeepSparse repository here](https://github.com/neuralmagic/deepsparse/tree/main/examples/ultralytics-yolo).
+output:
+```
+usage: sparseml.yolov5.train [-h] [--weights WEIGHTS] [--cfg CFG] [--data DATA] [--hyp HYP] [--epochs EPOCHS] [--batch-size BATCH_SIZE] [--imgsz IMGSZ] [--rect]
+                             [--resume [RESUME]] [--nosave] [--noval] [--noautoanchor] [--evolve [EVOLVE]] [--bucket BUCKET] [--cache [CACHE]] [--image-weights]
+                             [--device DEVICE] [--multi-scale] [--single-cls] [--optimizer {SGD,Adam,AdamW}] [--sync-bn] [--workers WORKERS] [--project PROJECT]
+                             [--name NAME] [--exist-ok] [--quad] [--cos-lr] [--label-smoothing LABEL_SMOOTHING] [--patience PATIENCE] [--freeze FREEZE [FREEZE ...]]
+                             [--save-period SAVE_PERIOD] [--local_rank LOCAL_RANK] [--entity ENTITY] [--upload_dataset [UPLOAD_DATASET]]
+                             [--bbox_interval BBOX_INTERVAL] [--artifact_alias ARTIFACT_ALIAS] [--recipe RECIPE] [--disable-ema] [--max-train-steps MAX_TRAIN_STEPS]
+                             [--max-eval-steps MAX_EVAL_STEPS] [--one-shot] [--num-export-samples NUM_EXPORT_SAMPLES]
+
+optional arguments:
+  -h, --help            show this help message and exit
+  --weights WEIGHTS     initial weights path
+  --cfg CFG             model.yaml path
+  --data DATA           dataset.yaml path
+  --hyp HYP             hyperparameters path
+  --epochs EPOCHS
+  --batch-size BATCH_SIZE
+                        total batch size for all GPUs, -1 for autobatch
+...
+```
+
+SparseML inherits most arguments from the Ultralytics repository. [Check out the YOLOv5 documentation for usage](https://github.com/ultralytics/yolov5).
+
+## Quick Start: Sparse Transfer Learning
+
+### Sparse Transfer Learning Overview 
+
+Sparse Transfer is very similiar to the typical transfer learing process used to train YOLOv5 models, where we fine-tune a checkpoint pretrained on COCO onto a smaller downstream dataset. With Sparse Transfer Learning, however, we simply start the fine-tuning process from a pre-sparsified checkpoint and maintain sparsity while the training process occurs.
+
+Here, we will fine-tune a [75% pruned-quantized version of YOLOv5s](https://sparsezoo.neuralmagic.com/models/yolov5-s-coco-pruned75_quantized?comparison=yolov5-s-coco-base&tab=0) onto VOC. 
+
+### Kick off Training
+
+We will use SparseML's `sparseml.yolov5.train` training script.
+
+To run sparse transfer learning, we first need to create/select a sparsification recipe. For sparse transfer, we need a recipe that instructs SparseML to maintain sparsity during training and to quantize the model over the final epochs.
+
+For the VOC dataset, there is a [transfer learning recipe available in SparseZoo](https://sparsezoo.neuralmagic.com/models/yolov5-s-coco-pruned75_quantized?comparison=yolov5-s-coco-base&tab=0), found under the recipes tab and identified by the following SparseZoo stub:
+```bash
+zoo:cv/detection/yolov5-s/pytorch/ultralytics/coco/pruned75_quant-none?recipe_type=transfer_learn
+```
+
+Here is what the recipe looks like:
+   
+```yaml
+version: 1.1.0
+
+# General variables
+num_epochs: 55
+quantization_epochs: 5
+quantization_lr: 1.e-5
+final_lr: 1.e-9
+
+training_modifiers:
+  - !EpochRangeModifier
+    start_epoch: 0
+    end_epoch: eval(num_epochs)
+
+  - !LearningRateFunctionModifier
+    start_epoch: eval(num_epochs - quantization_epochs)
+    end_epoch: eval(num_epochs)
+    lr_func: cosine
+    init_lr: eval(quantization_lr)
+    final_lr: eval(final_lr)
+
+pruning_modifiers:
+  - !ConstantPruningModifier
+    start_epoch: 0.0
+    params: __ALL_PRUNABLE__
+
+quantization_modifiers:
+  - !QuantizationModifier
+    start_epoch: eval(num_epochs - quantization_epochs)
+    submodules:
+      - model
+    custom_quantizable_module_types: ['SiLU']
+    exclude_module_types: ['SiLU']
+    quantize_conv_activations: False
+    disable_quantization_observer_epoch: eval(num_epochs - quantization_epochs + 2)
+    freeze_bn_stats_epoch: eval(num_epochs - quantization_epochs + 1)
+```
+   
+The key `Modifiers` for sparse transfer learning are the following:
+- `ConstantPruningModifier` instructs SparseML to maintain the sparsity structure of the network during the fine-tuning process
+- `QuantizationModifier` instructs SparseML to apply quantization aware training to quantize the weights over the final epochs
+
+SparseML parses the `Modifers` in the recipe and updates the training loop with logic encoded therein.
+
+Run the following to transfer learn from the 75% pruned-quantized YOLOv5s onto VOC:
+```bash
+sparseml.yolov5.train \
+  --weights zoo:cv/detection/yolov5-s/pytorch/ultralytics/coco/pruned75_quant-none?recipe_type=transfer_learn \
+  --recipe zoo:cv/detection/yolov5-s/pytorch/ultralytics/coco/pruned75_quant-none?recipe_type=transfer_learn \
+  --data VOC.yaml \
+  --hyp hyps/hyp.finetune.yaml --cfg yolov5s.yaml --patience 0
+```
+
+The script uses the SparseZoo stubs to identify and download the starting checkpoint and YAML-based recipe file from the SparseZoo. SparseML parses the transfer learning recipe and adjusts the training process to maintain sparsity during the fine-tuning process. It then kicks off the training process.
+
+The resulting model is 75% pruned and quantized and is trained on VOC!
+
+### Export to ONNX
+
+Run the `sparseml.yolov5.export_onnx` command to export the model to ONNX. Be sure the `--weights` argument points to your trained model.
+
+```bash
+sparseml.yolov5.export_onnx \
+  --weights yolov5_runs/train/exp/weights/last.pt \
+  --dynamic 
+```
+
+### DeepSparse Deployment
+
+Once exported to ONNX, you can deploy your models with DeepSparse. Checkout the [DeepSparse Repository](https://github.com/neuralmagic/deepsparse) for more details.
+
+## Next Steps
+
+Check out the tutorials for more details on additional functionality like training with other YOLOv5 versions and using custom datasets:
+
+- [Sparse Transfer Learning with the CLI](tutorials/sparse-transfer-learning.md) **[HIGHLY RECOMMENDED]**
+- [Sparsifying From Scratch with the CLI](tutorials/sparsify-from-scratch.md)

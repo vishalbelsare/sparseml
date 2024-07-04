@@ -17,9 +17,9 @@ Utility / helper functions
 """
 
 import logging
+import os
 import random
 import re
-import warnings
 from collections import OrderedDict, namedtuple
 from contextlib import contextmanager
 from copy import deepcopy
@@ -27,8 +27,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import numpy
 import torch
+from packaging import version
 from torch import Tensor
-from torch.nn import Linear, Module, Parameter
+from torch.nn import Embedding, Linear, Module, Parameter
 from torch.nn.modules.conv import Conv2d, Conv3d, _ConvNd
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
@@ -46,6 +47,7 @@ except Exception as _err:
     QATConv2d = None
 
 from sparseml.utils import create_dirs, save_numpy
+from sparsezoo import Model
 
 
 try:
@@ -53,6 +55,14 @@ try:
 except Exception as _err:
     quant_conv3d_err = _err
     QATConv3d = None
+
+
+try:
+    from transformers.modeling_utils import Conv1D as GPTConv1D
+except Exception as _err:
+    gpt_conv1d_err = _err
+    GPTConv1D = None
+
 
 __all__ = [
     "default_device",
@@ -74,12 +84,12 @@ __all__ = [
     "tensor_sample",
     "mask_difference",
     "get_layer",
-    "replace_layer",
     "get_terminal_layers",
     "get_conv_layers",
     "get_linear_layers",
     "get_prunable_layers",
     "get_quantizable_layers",
+    "swap_modules",
     "get_named_layers_and_params_by_regex",
     "any_str_or_regex_matches_param_name",
     "NamedLayerParam",
@@ -87,10 +97,17 @@ __all__ = [
     "set_deterministic_seeds",
     "torch_distributed_zero_first",
     "thin_model_from_checkpoint",
+    "MEMORY_BOUNDED",
+    "memory_aware_threshold",
+    "download_framework_model_by_recipe_type",
+    "detach",
+    "adjust_quantization_for_onnx_export",
+    "get_dependency_order",
 ]
 
 
 _LOGGER = logging.getLogger(__name__)
+_PARSED_TORCH_VERSION = version.parse(torch.__version__)
 
 
 ##############################
@@ -313,7 +330,7 @@ def tensors_to_device(
             [(key, tensors_to_device(tens, device)) for key, tens in tensors.items()]
         )
 
-    if isinstance(tensors, Dict):
+    if isinstance(tensors, Mapping):
         return {key: tensors_to_device(tens, device) for key, tens in tensors.items()}
 
     if isinstance(tensors, tuple):
@@ -339,7 +356,7 @@ def tensors_to_precision(
     if isinstance(tensors, Tensor):
         return tensors.float() if full_precision else tensors.half()
 
-    if isinstance(tensors, Dict):
+    if isinstance(tensors, Mapping):
         return {
             key: tensors_to_precision(tens, full_precision)
             for key, tens in tensors.items()
@@ -520,7 +537,8 @@ def _tensors_export_batch(
         return
 
     if isinstance(tensors, Iterable):
-        for index, tens in enumerate(zip(*tensors)):
+        # TODO: I am breaking something here? - dbogunowicz
+        for index, tens in enumerate(tensors):
             exported_paths.append(
                 tensor_export(
                     tens, export_dir, "{}-{:04d}".format(name_prefix, counter + index)
@@ -694,6 +712,9 @@ def get_layer(name: str, module: Module) -> Module:
     :param module: the module containing the layer to grab
     :return: the module representing the layer in the module
     """
+    if not name:
+        return module
+
     layers = name.split(".")
     layer = module
 
@@ -701,31 +722,6 @@ def get_layer(name: str, module: Module) -> Module:
         layer = layer.__getattr__(name)
 
     return layer
-
-
-def replace_layer(
-    module: Module,
-    name: str,
-    replace: Module,
-) -> Module:
-    """
-    General function to replace a layer in a module with the given new one.
-
-    :param module: the module to replace the layer in
-    :param name: the name of the layer to replace the activation for
-    :param replace: the module to replace the layer with
-    :return: the original layer that was replaced
-    """
-    parent = module
-    sections = name.split(".")
-
-    for sec in sections[:-1]:
-        parent = parent.__getattr__(sec)
-
-    cur = parent.__getattr__(sections[-1])
-    parent.__setattr__(sections[-1], replace)
-
-    return cur
 
 
 def get_terminal_layers(module: Module) -> Dict[str, Module]:
@@ -756,7 +752,9 @@ def get_conv_layers(module: Module) -> Dict[str, Module]:
     :return: a list of all the conv layers in the module
     """
     return {
-        name: mod for name, mod in module.named_modules() if isinstance(mod, _ConvNd)
+        name: mod
+        for name, mod in module.named_modules()
+        if (isinstance(mod, _ConvNd) or (GPTConv1D and isinstance(mod, GPTConv1D)))
     }
 
 
@@ -781,10 +779,12 @@ def get_prunable_layers(module: Module) -> List[Tuple[str, Module]]:
         for (name, mod) in module.named_modules()
         if (
             isinstance(mod, Linear)
+            or isinstance(mod, Embedding)
             or isinstance(mod, _ConvNd)
             or (QATLinear and isinstance(mod, QATLinear))
             or (QATConv2d and isinstance(mod, QATConv2d))
             or (QATConv3d and isinstance(mod, QATConv3d))
+            or (GPTConv1D and isinstance(mod, GPTConv1D))
         )
     ]
 
@@ -793,7 +793,7 @@ def get_quantizable_layers(module: Module) -> List[Tuple[str, Module]]:
     """
     :param module: the module to get the quantizable layers from
     :return: a list containing the names and modules of the quantizable layers
-        (Linear, Conv2d, Conv3d)
+        (Embedding, Linear, Conv2d, Conv3d)
     """
     if QATLinear is None:
         raise ImportError(
@@ -806,6 +806,7 @@ def get_quantizable_layers(module: Module) -> List[Tuple[str, Module]]:
         for (name, mod) in module.named_modules()
         if (
             isinstance(mod, Linear)
+            or isinstance(mod, Embedding)
             or isinstance(mod, Conv2d)
             or (QATConv3d and isinstance(mod, Conv3d))
         )
@@ -816,29 +817,15 @@ def get_quantized_layers(module: Module) -> List[Tuple[str, Module]]:
     """
     :param module: the module to get the quantized layers from
     :return: a list containing the names and modules of the quantized layers
-        (Linear, Conv2d, Conv3d)
+        (Embedding, Linear, Conv2d, Conv3d)
     """
-    if QATLinear is None:
-        raise ImportError(
-            "PyTorch version is not setup for Quantization. "
-            "Please install a QAT compatible version of PyTorch"
-        )
 
     quantized_layers = []
     for (name, mod) in module.named_modules():
-        if (
-            (QATLinear and isinstance(mod, QATLinear))
-            or (QATConv2d and isinstance(mod, QATConv2d))
-            or (QATConv3d and isinstance(mod, QATConv3d))
-        ):
-            quantized_layers.append((name, mod))
-
-        elif isinstance(mod, Conv3d) and not QATConv3d:
-            warnings.warn(
-                "Pytorch version is not setup for Conv3D Quantization. "
-                "Quantization of Conv3D layers will be skipped",
-                UserWarning,
-            )
+        if hasattr(mod, "quantization_scheme"):
+            weight_scheme = getattr(mod.quantization_scheme, "weights", None)
+            if weight_scheme is not None and hasattr(mod, "weight"):
+                quantized_layers.append((name, mod))
 
     return quantized_layers
 
@@ -965,13 +952,13 @@ def set_deterministic_seeds(seed: int = 0):
 
 
 @contextmanager
-def torch_distributed_zero_first(local_rank: int):
+def torch_distributed_zero_first(local_rank: Optional[int]):
     """
     Decorator to make all processes in distributed training wait for each
     local 0 ranked process to do something.
     :param local_rank: the local rank of this process
     """
-    if local_rank not in [-1, 0]:
+    if local_rank is not None and local_rank not in [-1, 0]:
         torch.distributed.barrier()
     yield
     if local_rank == 0:
@@ -1072,3 +1059,189 @@ def thin_model_from_checkpoint(model: Module, state_dict: Dict[str, Any]):
             f"Thinned layer {layer_name} from shape {orig_shape} to "
             f"{layer.weight.shape}"
         )
+
+
+##############################
+#
+# misc pytorch helper functions
+#
+##############################
+
+
+MEMORY_BOUNDED = "MEMORY_BOUNDED"
+
+
+def memory_aware_threshold(tensor: torch.Tensor, idx: int) -> Tensor:
+    """
+    Finds a threshold at the lookup idx in the most efficient way with available
+    resources. Will be phased out when GPU-memory overhead of torch.sort reduces,
+    or when torch.kthvalue becomes faster than torch.sort.
+
+    :param tensor: A tensor to find a k-th smallest value in, where k=idx+1
+    :param idx: A lookup index
+    :return: k-th smallest value from the given tensor, where k=idx+1
+    """
+    try:
+        if (
+            MEMORY_BOUNDED in os.environ
+            and os.environ[MEMORY_BOUNDED].lower() == "true"
+        ):
+            return torch.kthvalue(tensor.reshape(-1), idx + 1)[0]
+        else:
+            return torch.sort(tensor.reshape(-1))[0][idx]
+    except RuntimeError:
+        _LOGGER.warning(
+            "Finding threshold from sparsity failed due to lack of memory, "
+            "will attempt to recover. Consider setting env variable "
+            f"{MEMORY_BOUNDED}=True in future runs."
+        )
+        torch.cuda.empty_cache()
+        os.environ[MEMORY_BOUNDED] = "True"
+        return torch.kthvalue(tensor.view(-1), idx + 1)[0]
+
+
+def download_framework_model_by_recipe_type(
+    zoo_model: Model, recipe_name: Optional[str] = None, model_suffix: str = "pth"
+) -> str:
+    """
+    Extract the path of the framework model from the
+    zoo model, conditioned on the name of the recipe
+    By default, the function will return path to the final framework model
+    :params zoo_model: model object from sparsezoo
+    :params recipe_name: a name of the recipe (e.g. "transfer_learn", "original" etc.)
+    :params model_suffix: model_suffix that models are saved with
+    :return: path to the framework model
+    """
+
+    # default to model query params if available
+    recipe_name = recipe_name or (
+        zoo_model.stub_params.get("recipe_type") or zoo_model.stub_params.get("recipe")
+    )
+
+    framework_model = None
+    if recipe_name and "transfer" in recipe_name.lower():
+        # fetching the model for transfer learning
+        model_name = f"model.ckpt.{model_suffix}"
+        framework_model = zoo_model.training.default.get_file(model_name)
+
+    if framework_model is None:
+        # fetching the model for inference or fall back if model.ckpt.pth doesn't exist
+        model_name = f"model.{model_suffix}"
+        framework_model = zoo_model.training.default.get_file(model_name)
+
+    return framework_model.path
+
+
+def detach(x: Union[torch.Tensor, List, Tuple]):
+    if isinstance(x, torch.Tensor):
+        return x.detach()
+    elif isinstance(x, List):
+        return [detach(e) for e in x]
+    elif isinstance(x, Tuple):
+        return tuple([detach(e) for e in x])
+    else:
+        raise ValueError("Unexpected type to detach")
+
+
+def adjust_quantization_for_onnx_export(module: torch.nn.Module) -> torch.nn.Module:
+    # supported pytorch ranges are int8 or uint8
+    allowed_ranges = [(0, 127), (0, 255), (-128, 127)]
+    fake_quant_modules = [
+        m for m in module.modules() if m.__class__.__name__ == "FakeQuantize"
+    ]
+
+    if _PARSED_TORCH_VERSION >= version.parse("1.12"):
+        for quant in fake_quant_modules:
+            # original ranges preserved in quant.quant_min and quant.quant_max
+            quant_range = (
+                quant.activation_post_process.quant_min,
+                quant.activation_post_process.quant_max,
+            )
+            if quant_range not in allowed_ranges:
+                if quant_range[0] < 0:  # convert signed range to int8
+                    quant.activation_post_process.quant_min = -128
+                    quant.activation_post_process.quant_max = 127
+                else:  # convert unsigned range to uint8
+                    quant.activation_post_process.quant_min = 0
+                    quant.activation_post_process.quant_max = 255
+            # don't update observer since ranges are artificially modified
+            quant.observer_enabled[0] = 0
+
+    else:  # backwards compatibility for torch <= 1.11
+        for quant in fake_quant_modules:
+            quant_range = (quant.quant_min, quant.quant_max)
+            if quant_range not in allowed_ranges:
+                if quant_range[0] < 0:  # convert signed range to int8
+                    quant.quant_min = -128
+                    quant.quant_max = 127
+                else:  # convert unsigned range to uint8
+                    quant.quant_min = 0
+                    quant.quant_max = 255
+            # don't update observer since ranges are artificially modified
+            quant.observer_enabled[0] = 0
+
+
+def get_dependency_order(
+    layer: Module, subset: Dict, an_input: Tensor, **kwargs
+) -> List[str]:
+    """
+    Get a list of a subset of modules in layer ordered by execution order, which honors
+    the dependencies in the graph
+
+    :param layer: pytorch module to calculate dependencies for
+    :param subset: subset of modules in the layer to include in the ordering
+    :param an_input: example input to pass through the layer forward pass, used to
+        determine execution order
+
+    :return: list of module names in execution order
+    """
+    order = []
+
+    def exe_input(name):
+        def _exe_input(_, inp, out):
+            if name in subset:
+                order.append(name)
+
+        return _exe_input
+
+    # register a hook for each module of interest, will be triggered in exeuction order
+    handles = [subset[name].register_forward_hook(exe_input(name)) for name in subset]
+    layer(an_input, **kwargs)
+    for h in handles:
+        h.remove()
+    return order
+
+
+def swap_modules(
+    module: torch.nn.Module, submodule_name: str, submodule_to_replace: torch.nn.Module
+) -> torch.nn.Module:
+    """
+    Iteratively unfold the submodules of the module according to the submodule_name
+    to eventually replace the leaf submodule (accessed from the module through the
+    submodule_name) with the submodule_to_replace.
+
+    E.g
+    ```
+    swap_modules(module=Model,
+                 module_name="layers.0.sublayer",
+                 module_to_replace=ReplaceModule
+                 )
+    ```
+    this will iteratively traverse through the submodules
+    'layers' -> '0' -> to eventually replace 'sublayer' with ReplaceModule
+
+    :param module: the module to replace with the module_to_replace
+    :param submodule_name: the name of the module to replace
+    :param submodule_to_replace: the module to replace the module with
+    :return: the replaced module
+    """
+    parent = module
+    sections = submodule_name.split(".")
+
+    for sec in sections[:-1]:
+        parent = parent.__getattr__(sec)
+
+    cur = parent.__getattr__(sections[-1])
+    parent.__setattr__(sections[-1], submodule_to_replace)
+
+    return cur

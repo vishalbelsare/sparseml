@@ -195,10 +195,10 @@ class ONNXGraph(object):
         deletes the given nodes from the graph
         :param nodes: list of nodes to delete
         """
-        node_ouptut_ids_to_delete = {node.output[0] for node in nodes}
+        node_output_ids_to_delete = {node.output[0] for node in nodes}
         nodes_to_keep = []
         for node in self._model.graph.node:
-            if node.output[0] in node_ouptut_ids_to_delete:
+            if node.output[0] in node_output_ids_to_delete:
                 self._delete_node_edges(node)
             else:
                 nodes_to_keep.append(node)
@@ -242,11 +242,66 @@ class ONNXGraph(object):
             ]
         )  # delete inits that have no edge
 
+    def find_orphaned_nodes(self, node: NodeProto) -> List[NodeProto]:
+        """
+        Given a node, that is to be removed from the graph, find all nodes that
+        will be orphaned as a result of the removal. Orphaned nodes are nodes
+        that will have no inputs after the removal of the given node.
+        The method traverses the graph upwards from the given node until
+        a node with multiple outputs is found. All nodes that are traversed
+        are considered orphaned and will be removed.
+
+        :param node: The node to remove
+        :return: A tuple of the model and a list of orphaned nodes
+        """
+        nodes_to_delete = [node]
+        # start queue with previous positions input node
+        queue = [node]
+        while queue:
+            current_node = queue.pop(0)
+            if not isinstance(current_node, NodeProto):
+                continue
+            node_parents = self.get_node_parents(current_node)
+            # if node parent has only one output (current child)
+            # than it is orphaned and will be removed.
+            # continue traversing the graph upwards until
+            # a node with output that is not current child is found
+            for parent in node_parents:
+
+                if not isinstance(parent, NodeProto):
+                    # if parent is not a node, it is a graph input
+                    # and should not be removed
+                    continue
+                elif parent.op_type == "Constant":
+                    # if constant node is found,
+                    # automatically remove it and continue traversing
+                    nodes_to_delete.append(parent)
+
+                parent_output_node_names = set(
+                    n.name for n in self.get_node_parents(node=parent)
+                )
+                if len(parent_output_node_names) == 1:
+                    # if parent has only one output, it is orphaned
+                    queue.append(parent)
+                    nodes_to_delete.append(parent)
+                elif not parent_output_node_names.difference(
+                    set(n.name for n in nodes_to_delete)
+                ):
+                    # if parent has multiple outputs, but they are all already in the
+                    # nodes_to_delete list, it is orphaned
+                    queue.append(parent)
+                    nodes_to_delete.append(parent)
+
+        return nodes_to_delete
+
     def sort_nodes_topologically(self):
         """
         Sorts the order of the graph Node repeated field in place in topological
         order as per the ONNX Model proto specifications
         """
+        if len(self._model.graph.node) == 1:
+            return
+
         # build toposort DAG input and sort
         model_dag = defaultdict(set)  # node_id -> dependencies
         for parent_node_id, child_nodes in self._input_id_to_nodes.items():
@@ -272,6 +327,48 @@ class ONNXGraph(object):
         assert len(updated_node_list) == len(self._model.graph.node)
         self._model.graph.ClearField("node")
         self._model.graph.node.extend(updated_node_list)
+
+    def get_orphaned_nodes(
+        self,
+        graph_output_ids: Optional[Iterable[str]] = None,
+    ) -> List[NodeProto]:
+        """
+        :param graph_output_ids: iterable of output ids in graph. if not supplied,
+            will be read from the model
+        :return: list of all nodes in the graph that are not inputs to
+            other nodes or outputs of the graph
+        """
+        if graph_output_ids is None:
+            graph_output_ids = {output.name for output in self._model.graph.output}
+
+        orphaned_nodes = []
+        for node in self.nodes:
+            node_is_orphaned = True
+            # iterate over possible output ids, in practice, there is almost
+            # always only 1
+            for out_id in node.output:
+                if out_id in self._input_id_to_nodes or out_id in graph_output_ids:
+                    node_is_orphaned = False
+            if node_is_orphaned:
+                orphaned_nodes.append(node)
+        return orphaned_nodes
+
+    def delete_orphaned_node_branches(self):
+        """
+        Deletes all nodes in the graph that are not inputs to other nodes or outputs of
+        the graph. Additionally deletes all nodes that would become orphaned
+        after the node deletion until the graph contains no orphaned nodes
+        """
+        graph_output_ids = {output.name for output in self._model.graph.output}
+        orphaned_nodes = self.get_orphaned_nodes(graph_output_ids=graph_output_ids)
+
+        while orphaned_nodes:
+            # no need to refresh self, delete nodes should update internal graph edges
+            self.delete_nodes(orphaned_nodes)
+            self.update()
+            self.delete_unused_initializers()
+            # update now orphaned nodes, can only run up to len(nodes) times
+            orphaned_nodes = self.get_orphaned_nodes(graph_output_ids=graph_output_ids)
 
     def _store_node_edges(self, node: NodeProto):
         for output_id in node.output:
@@ -322,24 +419,16 @@ def swap_node_output(node: onnx.NodeProto, output: str) -> None:
     node.output.append(output)
 
 
-def remove_node_and_params_from_graph(
-    model: ModelProto,
-    node: onnx.NodeProto,
-    keep_params: Iterable[str] = None,
-) -> None:
+def remove_node_and_params_from_graph(model: ModelProto, node: onnx.NodeProto) -> None:
     """
     Deletes a node from the mdoel graph as well as its parameters listed in node.input
 
     :param model: Model to delete from
     :param node: Node to delete
-    :param keep_params: Names of node input initializers not to remove from graph
-        default is None.
     """
-    keep_params = keep_params or []
-    for param in model.graph.initializer:
-        if param.name not in keep_params and param.name in node.input:
-            model.graph.initializer.remove(param)
     model.graph.node.remove(node)
+    graph = ONNXGraph(model)
+    graph.delete_unused_initializers()
 
 
 def _override_tensor_batch_dim(model, tensor, batch_size):

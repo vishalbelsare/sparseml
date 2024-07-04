@@ -21,6 +21,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
+from packaging import version
 from torch.utils.data import DataLoader
 
 from sparseml.pytorch.optim import ScheduledModifierManager, ScheduledOptimizer
@@ -31,8 +32,10 @@ from sparseml.pytorch.utils import (
     ModuleTester,
     ModuleTrainer,
     default_device,
+    download_framework_model_by_recipe_type,
     is_parallel_model,
 )
+from sparsezoo import Model
 
 
 _LOGGER = logging.getLogger(__file__)
@@ -109,6 +112,7 @@ class ImageClassificationTrainer(Trainer):
         recipe_args: Optional[str] = None,
         max_train_steps: int = -1,
         one_shot: bool = False,
+        gradient_accum_steps: int = 1,
     ):
         """
         Initializes the module_trainer
@@ -130,6 +134,7 @@ class ImageClassificationTrainer(Trainer):
         self.recipe_args = recipe_args
         self.max_train_steps = max_train_steps
         self.one_shot = one_shot
+        self._gradient_accum_steps = gradient_accum_steps
 
         self.val_loss = loss_fn()
         _LOGGER.info(f"created loss for validation: {self.val_loss}")
@@ -191,9 +196,15 @@ class ImageClassificationTrainer(Trainer):
         :returns: Results from validation or training run
         """
         train_mode = mode == "train"
-        validation_mode = not train_mode
+        validation_mode = mode == "val"
+        if not (train_mode or validation_mode):
+            raise ValueError(f"Invalid train mode '{mode}', must be 'train' or 'val'")
 
-        if torch.__version__ < "1.9" and self.manager.qat_active(epoch=self.epoch):
+        if (
+            version.parse(torch.__version__) < version.parse("1.9")
+            and self.manager
+            and (self.manager.qat_active(epoch=self.epoch))
+        ):
             # switch off fp16
             self._device_context.use_mixed_precision = False
 
@@ -222,8 +233,11 @@ class ImageClassificationTrainer(Trainer):
         _LOGGER.info(f"Applied {self.recipe_path} to manager")
 
     def _initialize_module_tester(self):
+        # This uses self.model.module unlike the ModuleTrainer which uses self.model
+        # so that the validation runs on the local copy of the model on the rank 0 gpu
+        # rather than on the distributed model
         tester = ModuleTester(
-            module=self.model,
+            module=self.model.module if is_parallel_model(self.model) else self.model,
             device=self.device,
             loss=self.val_loss,
             loggers=self.loggers,
@@ -273,6 +287,7 @@ class ImageClassificationTrainer(Trainer):
             optimizer=self.optim,
             loggers=self.loggers,
             device_context=self._device_context,
+            num_accumulated_batches=self._gradient_accum_steps,
         )
         _LOGGER.info(f"created Module Trainer: {trainer}")
 
@@ -292,6 +307,7 @@ class ImageClassificationTrainer(Trainer):
             return self.module_tester.run_epoch(
                 self.val_loader,
                 epoch=-1 if baseline_run else self.epoch,
+                max_epochs=-1 if baseline_run else self.max_epochs,
                 max_steps=max_steps,
             )
 
@@ -314,11 +330,16 @@ class ImageClassificationTrainer(Trainer):
         return self.module_trainer.run_epoch(
             data_loader=self.train_loader,
             epoch=self.epoch,
+            max_epochs=self.max_epochs,
             max_steps=max_steps,
             show_progress=self.is_main_process,
         )
 
     def _setup_checkpoint_manager(self):
+        if self.checkpoint_path and self.checkpoint_path.startswith("zoo:"):
+            zoo_model = Model(self.checkpoint_path)
+            self.checkpoint_path = download_framework_model_by_recipe_type(zoo_model)
+
         checkpoint_state = torch.load(self.checkpoint_path)
         checkpoint_manager = None
         checkpoint_recipe = checkpoint_state.get("recipe")

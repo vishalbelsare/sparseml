@@ -1,21 +1,25 @@
 .PHONY: build docs test
 
 BUILDDIR := $(PWD)
-CHECKDIRS := integrations src tests utils setup.py
-CHECKGLOBS := 'integrations/**/*.py' 'src/**/*.py' 'tests/**/*.py' 'utils/**/*.py' setup.py
+CHECKDIRS := integrations src tests utils status examples setup.py
+CHECKGLOBS := 'integrations/**/*.py' 'src/**/*.py' 'tests/**/*.py' 'utils/**/*.py' 'status/**/*.py' setup.py
 DOCDIR := docs
 MDCHECKGLOBS := 'docs/**/*.md' 'docs/**/*.rst' 'integrations/**/*.md'
 MDCHECKFILES := CODE_OF_CONDUCT.md CONTRIBUTING.md DEVELOPING.md README.md
 SPARSEZOO_TEST_MODE := "true"
 
 BUILD_ARGS :=  # set nightly to build nightly release
-TARGETS := ""  # targets for running pytests: deepsparse,keras,onnx,pytorch,pytorch_models,pytorch_datasets,tensorflow_v1,tensorflow_v1_models,tensorflow_v1_datasets
+TARGETS := ""  # targets for running pytests: deepsparse,keras,onnx,pytorch,pytorch_models,export,pytorch_datasets,tensorflow_v1,tensorflow_v1_models,tensorflow_v1_datasets
 PYTEST_ARGS ?= ""
+PYTEST_INTEG_ARGS ?= ""
 ifneq ($(findstring deepsparse,$(TARGETS)),deepsparse)
     PYTEST_ARGS := $(PYTEST_ARGS) --ignore tests/sparseml/deepsparse
 endif
 ifneq ($(findstring transformers,$(TARGETS)),transformers)
     PYTEST_ARGS := $(PYTEST_ARGS) --ignore tests/sparseml/transformers
+endif
+ifneq ($(findstring export,$(TARGETS)),export)
+    PYTEST_ARGS := $(PYTEST_ARGS) --ignore tests/sparseml/export
 endif
 ifneq ($(findstring keras,$(TARGETS)),keras)
     PYTEST_ARGS := $(PYTEST_ARGS) --ignore tests/sparseml/keras
@@ -41,6 +45,16 @@ endif
 ifneq ($(findstring tensorflow_v1_datasets,$(TARGETS)),tensorflow_v1_datasets)
     PYTEST_ARGS := $(PYTEST_ARGS) --ignore tests/sparseml/tensorflow_v1/datasets
 endif
+ifneq ($(findstring image_classification,$(TARGETS)),image_classification)
+    PYTEST_INTEGRATION_ARGS := $(PYTEST_INTEGRATION_ARGS) --ignore tests/integrations/image_classification
+endif
+ifneq ($(findstring transformers,$(TARGETS)),transformers)
+    PYTEST_INTEGRATION_ARGS := $(PYTEST_INTEGRATION_ARGS) --ignore tests/integrations/transformers
+endif
+ifneq ($(findstring yolov5,$(TARGETS)),yolov5)
+    PYTEST_INTEGRATION_ARGS := $(PYTEST_INTEGRATION_ARGS) --ignore tests/integrations/yolov5
+endif
+
 
 # run checks on all files for the repo
 quality:
@@ -62,7 +76,12 @@ style:
 # run tests for the repo
 test:
 	@echo "Running python tests";
-	SPARSEZOO_TEST_MODE="true" pytest tests $(PYTEST_ARGS)
+	SPARSEZOO_TEST_MODE="true" pytest tests $(PYTEST_ARGS) --ignore tests/integrations
+
+# run integration tests
+testinteg:
+	@echo "Running integration tests";
+	SPARSEZOO_TEST_MODE="true" pytest -x -ls tests/integrations $(PYTEST_INTEGRATION_ARGS)
 
 # create docs
 docs:

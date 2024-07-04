@@ -17,15 +17,19 @@ Code related to interacting with a trained model such as saving, loading, etc
 """
 
 from collections import OrderedDict
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+from packaging import version
 from torch.nn import DataParallel, Module
 from torch.optim.optimizer import Optimizer
 
-from sparseml.pytorch.utils.helpers import thin_model_from_checkpoint
+from sparseml.pytorch.utils.helpers import (
+    download_framework_model_by_recipe_type,
+    thin_model_from_checkpoint,
+)
 from sparseml.utils.helpers import create_parent_dirs
-from sparsezoo import Zoo
+from sparsezoo import Model
 
 
 try:
@@ -35,7 +39,6 @@ try:
 except Exception as ddp_error:
     DDP = None
     ddp_import_error = ddp_error
-
 
 __all__ = [
     "load_model",
@@ -75,25 +78,26 @@ def load_model(
         This removes "module." all keys
     """
     if path.startswith("zoo:"):
-        if "recipe_type=" in path:
-            path = Zoo.download_recipe_base_framework_files(path, extensions=[".pth"])[
-                0
-            ]
-        else:
-            path = Zoo.load_model_from_stub(path).download_framework_files(
-                extensions=[".pth"]
-            )[0]
-    model_dict = torch.load(path, map_location="cpu")
-    current_dict = model.state_dict()
+        path = download_framework_model_by_recipe_type(Model(path))
+    model_dict: Union[Module, Dict[str, Any]] = torch.load(path, map_location="cpu")
+
+    if isinstance(model_dict, Module):
+        model_dict = {
+            "state_dict": model_dict.state_dict(),
+        }
+
     recipe = model_dict.get("recipe")
 
     if recipe:
         from sparseml.pytorch.optim import ScheduledModifierManager
 
-        epoch = model_dict.get("epoch", float("inf"))
+        epoch = model_dict.get("epoch", -1)
+        if epoch == -1:
+            epoch = float("inf")
         checkpoint_manager = ScheduledModifierManager.from_yaml(recipe)
         checkpoint_manager.apply_structure(module=model, epoch=epoch)
 
+    current_dict = model.state_dict()
     if "state_dict" in model_dict:
         model_dict = model_dict["state_dict"]
 
@@ -245,7 +249,7 @@ def save_model(
     if arch_key:
         save_dict["arch_key"] = arch_key
 
-    if torch.__version__ < "1.6":
+    if version.parse(torch.__version__) < version.parse("1.6"):
         torch.save(save_dict, path)
     else:
         torch.save(

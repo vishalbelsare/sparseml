@@ -20,7 +20,7 @@ are implemented as modifiers.
 """
 
 import math
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
 
 from torch import Tensor
 from torch.nn import Module
@@ -52,10 +52,21 @@ class PyTorchModifierYAML(ModifierYAML):
     """
     A decorator to handle making a pytorch modifier class YAML ready.
     IE it can be loaded in through the yaml plugin easily.
+
+    :param swap_class_by_state_fn: optional function to provide a different class
+        to construct on yaml load based on the state given (ie provide a
+        legacy class to load if certain parameters are passed). Expected format
+        is to take a dict of kwargs, expects a class to be returned
     """
 
-    def __init__(self):
-        super().__init__(PYTORCH_FRAMEWORK)
+    def __init__(
+        self,
+        swap_class_by_state_fn: Callable[[Dict[str, Any]], Type[BaseModifier]] = None,
+    ):
+        super().__init__(
+            PYTORCH_FRAMEWORK,
+            swap_class_by_state_fn=swap_class_by_state_fn,
+        )
 
 
 class Modifier(BaseModifier):
@@ -234,9 +245,6 @@ class Modifier(BaseModifier):
         :param loggers: the logger maanger to setup this modifier with for logging
         important info and milestones to
         """
-        if self._loggers_initialized and self._loggers:
-            return
-
         loggers = loggers or []
         if isinstance(loggers, List):
             loggers = LoggerManager(loggers)
@@ -411,7 +419,7 @@ class ScheduledModifier(Modifier, BaseScheduled):
     :param end_comparator: integer value representing how the end_epoch should be
         compared to start_epoch.
         if == None, then end_epoch can only be set to what its initial value was.
-        if == -1, then end_epoch can be less than, equal, or greater than start_epoch.
+        if == -1, then end_epoch can be -1, equal, or greater than start_epoch.
         if == 0, then end_epoch can be equal to or greater than start_epoch.
         if == 1, then end_epoch can only be greater than start_epoch.
     :param kwargs: standard key word args, used to support multi inheritance
@@ -430,7 +438,9 @@ class ScheduledModifier(Modifier, BaseScheduled):
             epoch = kwargs.get("epoch", None)
             steps_per_epoch = kwargs.get("steps_per_epoch", None)
             # Log call state
-            if self.loggers and self.loggers.log_ready(epoch, self._last_log_epoch):
+            if self.loggers and self.loggers.log_ready(
+                epoch=epoch, last_log_epoch=self._last_log_epoch
+            ):
                 self.log_string(
                     string=(
                         f"Calling {func.__name__} with:\n"
@@ -443,7 +453,9 @@ class ScheduledModifier(Modifier, BaseScheduled):
                 )
             out = func(*args, **kwargs)
             # Log return state
-            if self.loggers and self.loggers.log_ready(epoch, self._last_log_epoch):
+            if self.loggers and self.loggers.log_ready(
+                epoch=epoch, last_log_epoch=self._last_log_epoch
+            ):
                 out_print = out if isinstance(out, Tuple) else [out]
                 self.log_string(
                     string=(f"\nReturned: {format_args(out_print)}\n"),
@@ -663,7 +675,9 @@ class ScheduledModifier(Modifier, BaseScheduled):
         if not self._enabled:
             raise RuntimeError("modifier must be enabled")
 
-        if self.loggers and self.loggers.log_ready(epoch, self._last_log_epoch):
+        if self.loggers and self.loggers.log_ready(
+            epoch=epoch, last_log_epoch=self._last_log_epoch
+        ):
             self._last_log_epoch = epoch
             self._scheduled_log_called = True
             self.log_update(module, optimizer, epoch, steps_per_epoch)
@@ -709,7 +723,7 @@ class ScheduledModifier(Modifier, BaseScheduled):
         level = level or LOGGING_LEVELS["debug"]
         step = (
             loggers.epoch_to_step(epoch, steps_per_epoch)
-            if (epoch and steps_per_epoch)
+            if (epoch is not None) and (steps_per_epoch is not None)
             else None
         )
         loggers.log_string(tag=tag, string=string, step=step, level=level)
@@ -725,9 +739,10 @@ class ScheduledModifier(Modifier, BaseScheduled):
     ):
         tag = tag or type(self).__name__
         loggers = loggers or self.loggers
+        edge_epochs = [None, float("-inf"), float("inf")]
         step = (
             loggers.epoch_to_step(epoch, steps_per_epoch)
-            if (epoch and steps_per_epoch)
+            if (epoch not in edge_epochs) and (steps_per_epoch is not None)
             else None
         )
         loggers.log_scalar(tag=tag, value=value, step=step, level=level)
@@ -779,7 +794,7 @@ class ScheduledUpdateModifier(ScheduledModifier, BaseUpdate):
     :param end_comparator: integer value representing how the end_epoch should be
         compared to start_epoch.
         if == None, then end_epoch can only be set to what its initial value was.
-        if == -1, then end_epoch can be less than, equal, or greater than start_epoch.
+        if == -1, then end_epoch can be -1, equal, or greater than start_epoch.
         if == 0, then end_epoch can be equal to or greater than start_epoch.
         if == 1, then end_epoch can only be greater than start_epoch.
     :param min_frequency: The minimum acceptable value for update_frequency, default -1

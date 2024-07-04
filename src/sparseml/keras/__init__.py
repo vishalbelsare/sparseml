@@ -18,6 +18,18 @@ Functionality for working with and sparsifying Models in the Keras framework
 
 # flake8: noqa
 
+from sparseml.utils import deprecation_warning as _deprecation_warning
+
+
+_deprecation_warning(
+    "sparseml.keras is deprecated and will be removed in a future version",
+)
+
+from sparseml.analytics import sparseml_analytics as _analytics
+
 from .base import *
 from .framework import detect_framework, framework_info, is_supported
 from .sparsification import sparsification_info
+
+
+_analytics.send_event("python__keras__init")

@@ -17,7 +17,6 @@ from typing import Any, Dict, List, NamedTuple, Union
 
 import pytest
 
-from flaky import flaky
 from sparseml.onnx.optim.sensitivity_pruning import (
     PruningLossSensitivityAnalysis,
     pruning_loss_sens_magnitude,
@@ -193,7 +192,7 @@ def _test_analysis_comparison(
             )
 
 
-@flaky(max_runs=2, min_passes=1)
+@pytest.mark.flaky(reruns=2, min_passes=1)
 def test_approx_ks_loss_sensitivity(
     onnx_models_with_analysis: OnnxModelAnalysisFixture,
 ):
@@ -203,13 +202,17 @@ def test_approx_ks_loss_sensitivity(
         onnx_models_with_analysis.loss_approx_path
     )
     expected_layers = sorted(
-        expected_analysis.dict()["results"], key=lambda x: x["index"]
+        expected_analysis.dict()["results"],
+        key=lambda x: (x["index"], x["id"] or "", x["name"] or ""),
     )
-    actual_layers = sorted(analysis.dict()["results"], key=lambda x: x["index"])
+    actual_layers = sorted(
+        analysis.dict()["results"],
+        key=lambda x: (x["index"], x["id"] or "", x["name"] or ""),
+    )
     _test_analysis_comparison(expected_layers, actual_layers, False)
 
 
-@flaky(max_runs=2, min_passes=1)
+@pytest.mark.flaky(reruns=2, min_passes=1)
 def test_one_shot_ks_loss_sensitivity(
     onnx_models_with_analysis: OnnxModelAnalysisFixture,
 ):
@@ -230,12 +233,13 @@ def test_one_shot_ks_loss_sensitivity(
     )
 
     expected_layers = sorted(
-        expected_analysis.dict()["results"], key=lambda x: x["index"]
+        expected_analysis.dict()["results"],
+        key=lambda x: (x["index"], x["id"] or "", x["name"] or ""),
     )
 
     actual_layers = sorted(
         analysis.dict()["results"],
-        key=lambda x: x["index"],
+        key=lambda x: (x["index"], x["id"] or "", x["name"] or ""),
     )
 
     _test_analysis_comparison(expected_layers, actual_layers, False)
@@ -244,7 +248,7 @@ def test_one_shot_ks_loss_sensitivity(
 @pytest.mark.skipif(
     deepsparse is None, reason="deepsparse is not installed on the system"
 )
-@flaky(max_runs=2, min_passes=1)
+@pytest.mark.flaky(reruns=2, min_passes=1)
 def test_one_shot_ks_perf_sensitivity(
     onnx_models_with_analysis: OnnxModelAnalysisFixture,
 ):
@@ -268,12 +272,13 @@ def test_one_shot_ks_perf_sensitivity(
     )
 
     expected_layers = sorted(
-        expected_analysis.dict()["results"], key=lambda x: x["index"]
+        expected_analysis.dict()["results"],
+        key=lambda x: (x["index"], x["id"] or "", x["name"] or ""),
     )
 
     actual_layers = sorted(
         analysis.dict()["results"],
-        key=lambda x: x["index"],
+        key=lambda x: (x["index"], x["id"] or "", x["name"] or ""),
     )
 
     _test_analysis_comparison(expected_layers, actual_layers, True)

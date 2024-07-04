@@ -17,6 +17,7 @@ Helper functions for retrieving information related to model sparsification
 """
 
 import json
+import logging
 from typing import (
     Any,
     Callable,
@@ -25,6 +26,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Optional,
     Tuple,
     Union,
 )
@@ -46,6 +48,8 @@ __all__ = [
     "GradSampler",
 ]
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class ModuleSparsificationInfo:
     """
@@ -54,13 +58,26 @@ class ModuleSparsificationInfo:
     and quantization
 
     :param module: torch Module to analyze
+    :param state_dict: optional state_dict to analyze in place of the torch model. This
+    is used when analyzing an FSDP model, where the full weights may not be accessible
     """
 
-    def __init__(self, module: Module):
+    def __init__(
+        self, module: Module, state_dict: Optional[Dict[str, torch.Tensor]] = None
+    ):
         self.module = module
-        self.trainable_params = list(
-            filter(lambda param: param.requires_grad, self.module.parameters())
-        )
+        self.state_dict = state_dict
+
+        if self.state_dict is not None:
+            # when analyzing an FSDP model, the state_dict does not differentiate
+            # between trainable and non-trainable parameters
+            # (e.g. it can contain buffers) this means that the
+            # self.trainable_parameters may be overestimated
+            self.trainable_params = [param for _, param in state_dict.items()]
+        else:
+            self.trainable_params = list(
+                filter(lambda param: param.requires_grad, self.module.parameters())
+            )
 
     def __str__(self):
         return json.dumps(
@@ -94,7 +111,7 @@ class ModuleSparsificationInfo:
         """
         return sum(
             round(tensor_sparsity(param).item() * torch.numel(param))
-            for param in self.trainable_params
+            for param in tqdm(self.trainable_params, desc="Calculating model sparsity")
         )
 
     @property
@@ -121,7 +138,9 @@ class ModuleSparsificationInfo:
         """
         return sum(
             round(tensor_sparsity(layer.weight).item() * torch.numel(layer.weight))
-            for (name, layer) in get_prunable_layers(self.module)
+            for (name, layer) in tqdm(
+                get_prunable_layers(self.module), desc="Calculating model sparsity"
+            )
         )
 
     @property
@@ -200,7 +219,7 @@ class GradSampler:
     def __init__(
         self,
         data_loader: Union[Iterator[Tuple[List[Any], Dict[str, Any], Any]], Callable],
-        loss_fn: Callable[[Any], Any],
+        loss_fn: Callable[[Any, Any], Any],
     ):
         if not isinstance(data_loader, Iterable) and not callable(data_loader):
             raise ValueError(
@@ -244,6 +263,11 @@ class GradSampler:
                     module.zero_grad()
                     # run sample forward and backwards pass
                     model_outputs = module(*forward_args, **forward_kwargs)
+                    # Image classification models have been overridden to compute both
+                    # the logit values and the probabilities, returning a tuple.
+                    #  No other models do this.
+                    if model_outputs.__class__ == tuple:
+                        model_outputs = model_outputs[0]
                     loss = self._loss_fn(model_outputs, loss_target)
                     loss.backward()
 
@@ -254,4 +278,11 @@ class GradSampler:
                         pbar.update(1)
                     if computed_grads >= num_grads:
                         break
+                if computed_grads < num_grads:
+                    _LOGGER.warning(
+                        f"The requested num_grads:{num_grads} is greater than allowed by the dataset. \
+                        Proceeding with less than requested. \
+                        Please reduce num_grads to suppress the warning."
+                    )
+                    break
         module.zero_grad()

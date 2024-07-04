@@ -24,7 +24,7 @@ import math
 from collections import OrderedDict
 from copy import deepcopy
 from functools import cmp_to_key
-from typing import Any, Dict, Generator, List, Optional, Union
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
 
 from sparseml.optim.modifier import BaseModifier, BaseObject, ModifierProp
 from sparseml.sparsification.types import SparsificationTypes
@@ -61,13 +61,13 @@ class BaseManager(BaseObject):
         if isinstance(modifiers, List):
             # sort modifiers by when they start and end so that later modifiers
             # can overwrite in a deterministic order such as when initializing
-            self._modifiers = _sort_modifiers_list(modifiers)
+            self._modifiers = self._sort_modifiers_list(modifiers)
         elif isinstance(modifiers, Dict):
             # staged recipe
             # sort modifiers of each stage by start/end as above then sort stages
             # by their modifiers
             modifiers = {
-                stage: _sort_modifiers_list(stage_modifiers)
+                stage: self._sort_modifiers_list(stage_modifiers)
                 for stage, stage_modifiers in modifiers.items()
             }
             self._modifiers = OrderedDict(
@@ -98,6 +98,10 @@ class BaseManager(BaseObject):
 
     def __eq__(self, compare: object) -> bool:
         return str(self) == str(compare)
+
+    @staticmethod
+    def _sort_modifiers_list(modifiers: List[BaseModifier]) -> List[BaseModifier]:
+        return sorted(modifiers, key=cmp_to_key(BaseModifier.comparator))
 
     @property
     def metadata(self):
@@ -238,16 +242,7 @@ class BaseManager(BaseObject):
 
             for additional_modifiers in additional_stages.values():
                 for additional_modifier in additional_modifiers:
-                    if (
-                        hasattr(additional_modifier, "end_epoch")
-                        and additional_modifier.end_epoch != -1
-                    ):
-                        # if end_epoch == -1, the .end_epoch is being
-                        # assumed implicitly and does not need to be
-                        # incremented
-                        additional_modifier.end_epoch += base_end_epoch
-                    if hasattr(additional_modifier, "start_epoch"):
-                        additional_modifier.start_epoch += base_end_epoch
+                    additional_modifier.advance_epochs(ref_start_epoch=base_end_epoch)
 
         combined_stages = base_stages
         combined_stages.update(additional_stages)
@@ -348,23 +343,7 @@ class BaseManager(BaseObject):
         """
         :return: the minimum epochs required by any of the modifiers under the manager
         """
-        vals = []
-        vals.extend(
-            [
-                math.floor(mod.start_epoch)
-                for mod in self.iter_modifiers()
-                if mod.start_epoch > -1
-            ]
-        )
-        vals.extend(
-            [
-                math.floor(mod.end_epoch)
-                for mod in self.iter_modifiers()
-                if mod.end_epoch > -1
-            ]
-        )
-
-        return min(vals) if len(vals) > 0 else -1
+        return _min_modifier_epoch(self.iter_modifiers())
 
     @ModifierProp(serializable=False)
     def max_epochs(self) -> int:
@@ -372,23 +351,7 @@ class BaseManager(BaseObject):
         :return: the maximum number of epochs required by any of the modifiers
             under the manager
         """
-        vals = []
-        vals.extend(
-            [
-                math.ceil(mod.start_epoch)
-                for mod in self.iter_modifiers()
-                if mod.start_epoch > -1
-            ]
-        )
-        vals.extend(
-            [
-                math.ceil(mod.end_epoch)
-                for mod in self.iter_modifiers()
-                if mod.end_epoch > -1
-            ]
-        )
-
-        return max(vals) if len(vals) > 0 else -1
+        return _max_modifier_epoch(self.iter_modifiers())
 
     def save(self, file_path: str, include_metadata: bool = True):
         """
@@ -566,13 +529,108 @@ class BaseManager(BaseObject):
             else False
         )
 
+    def phase(self, epoch: float) -> Optional[str]:
+        """
+        Computes the phase that the modifiers are in.
+
+        Example usage:
+
+        ```python
+        phase = BaseManager.compose_staged(
+            manager,
+            checkpoint_manager
+        ).phase()
+        if phase is not None:
+            checkpoint_name = "best_{phase}.pt"
+        ```
+
+        :return: One of the following strings based on the pruning and quantization
+            modifiers that this Manager contains.
+
+            0. None - if either pruning or quantization is currently in progress
+            1. "dense" - if no pruning or quantization
+            2. "dense_quantized" - if only quantization
+            3. "pruned" - if only pruning
+            4. "pruned_quantized" - if both pruning and quantization
+            5. "quantized_pruned" - if quantization was before pruning
+        """
+        pruners: List[BaseModifier] = self.pruning_modifiers
+        quantizers: List[BaseModifier] = self.quantization_modifiers
+
+        if len(pruners) == 0:
+            pruned = False
+            pruning_in_progress = False
+        else:
+            pruning_start = min(mod.start_epoch for mod in pruners)
+            pruning_end = max(mod.end_epoch for mod in pruners)
+            pruning_in_progress = pruning_start <= epoch <= pruning_end
+            pruned = epoch > pruning_end
+
+        if len(quantizers) == 0:
+            quantized = False
+            quantization_in_progress = False
+        else:
+            first_quant_epoch = min(mod.start_epoch for mod in quantizers)
+            last_quant_epoch = max(mod.start_epoch for mod in quantizers)
+            quantization_in_progress = first_quant_epoch <= epoch <= last_quant_epoch
+            quantized = epoch > last_quant_epoch
+
+        if pruning_in_progress or quantization_in_progress:
+            return None
+
+        if not pruned and not quantized:
+            return "dense"
+        elif quantized and not pruned:
+            return "dense_quantized"
+        elif pruned and not quantized:
+            return "pruned"
+        else:
+            if pruning_end < last_quant_epoch:
+                return "pruned_quantized"
+            else:
+                return "quantized_pruned"
+
+    def get_start_end_epochs(self) -> Dict[str, Tuple[float, float]]:
+        """
+        Return an OrderedDict mapping each stage to its min and max epoch. If not a
+        staged manager, map 'all' to the the min and max epochs
+        """
+        if isinstance(self.modifiers, List):
+            return OrderedDict({"all": (self.min_epochs, self.max_epochs)})
+        else:
+            stage_max_min = OrderedDict()
+            for stage, mod_list in self.modifiers.items():
+                epoch_min = _min_modifier_epoch(mod_list)
+                epoch_max = _max_modifier_epoch(mod_list)
+                stage_max_min[stage] = (epoch_min, epoch_max)
+
+            # post-process to replace -1's with their real values
+            epochs_list = list(stage_max_min.values())
+            for i, (stage, epochs) in enumerate(stage_max_min.items()):
+                # replace start epochs that are -1 with the last epoch of the previous
+                # stage, or 0 if it's the first stage
+                if epochs[0] == -1:
+                    stage_max_min[stage][0] = epochs_list[i - 1][1] if i > 0 else 0
+                # replace end epochs that are -1 with the next stage's start epoch,
+                # unless it's the last stage
+                if epochs[1] == -1 and i < len(epochs_list) - 1:
+                    stage_max_min[stage][1] = epochs_list[i + 1][0]
+
+            return stage_max_min
+
+    def get_last_start_epoch(self) -> float:
+        """
+        Return the start epoch of the last stage in the recipe. Useful for applying
+        recipes at the correct epoch in a staged run
+        """
+        stage_max_min = self.get_start_end_epochs()
+        last_stage_epochs = stage_max_min[next(reversed(stage_max_min))]
+        last_start_epoch = last_stage_epochs[0]
+        return last_start_epoch if last_start_epoch > -1 else 0
+
     def _info_log_metadata(self):
         metadata_str = json.dumps(self._metadata, indent=1)
-        _LOGGER.info(f"Created recipe manager with metadata: {metadata_str}")
-
-
-def _sort_modifiers_list(modifiers: List[BaseModifier]) -> List[BaseModifier]:
-    return sorted(modifiers, key=cmp_to_key(BaseModifier.comparator))
+        _LOGGER.debug(f"Created recipe manager with metadata: {metadata_str}")
 
 
 def _nested_dict_to_lines(
@@ -595,3 +653,28 @@ def _nested_dict_to_lines(
             # reached maximum nesting level.
             yaml_str_lines.append(indentation * nesting_depth + f"{key}: {value}")
     return yaml_str_lines
+
+
+def _min_modifier_epoch(modifiers: Iterable[BaseModifier]) -> float:
+    """
+    :return: the minimum epochs required by any of the modifiers provided
+    """
+    vals = [math.floor(mod.start_epoch) for mod in modifiers if mod.start_epoch > -1]
+
+    return min(vals) if len(vals) > 0 else -1
+
+
+def _max_modifier_epoch(modifiers: Iterable[BaseModifier]) -> float:
+    """
+    :return: the maximum number of epochs required by any of the modifiers provided
+    """
+    # save modifiers as list so it can iterated over multiple times
+    modifiers = [mod for mod in modifiers]
+
+    vals = []
+    vals.extend(
+        [math.ceil(mod.start_epoch) for mod in modifiers if mod.start_epoch > -1]
+    )
+    vals.extend([math.ceil(mod.end_epoch) for mod in modifiers if mod.end_epoch > -1])
+
+    return max(vals) if len(vals) > 0 else -1

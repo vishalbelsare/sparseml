@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Callable, Union
 
 import pytest
@@ -29,14 +28,7 @@ from sparseml.pytorch.models import (
 from tests.sparseml.pytorch.models.utils import compare_model
 
 
-@pytest.mark.skipif(
-    os.getenv("NM_ML_SKIP_PYTORCH_TESTS", False),
-    reason="Skipping pytorch tests",
-)
-@pytest.mark.skipif(
-    os.getenv("NM_ML_SKIP_MODEL_TESTS", False),
-    reason="Skipping model tests",
-)
+@pytest.mark.skip(reason="SSD Resnet models deprecated")
 @pytest.mark.parametrize(
     "key,pretrained,pretrained_backbone,test_input,match_const",
     [
@@ -48,7 +40,7 @@ from tests.sparseml.pytorch.models.utils import compare_model
         ("ssd300_resnet152", False, True, True, ssd300_resnet152),
     ],
 )
-def test_ssd_resnsets(
+def test_ssd_resnets(
     key: str,
     pretrained: Union[bool, str],
     pretrained_backbone: Union[bool, str],

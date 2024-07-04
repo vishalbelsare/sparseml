@@ -24,18 +24,16 @@ from typing import Any, Dict, List, NamedTuple, Tuple, Union
 
 import numpy
 import onnx
-import onnxruntime
 from onnx import ModelProto, NodeProto, TensorProto, numpy_helper
 from onnx.helper import get_attribute_value, make_empty_tensor_value_info
 
-from sparseml.utils import clean_path
+from sparseml.onnx.base import require_onnxruntime
+from sparsezoo.utils import load_model, save_onnx
 
 
 _LOGGER = logging.getLogger(__name__)
 
 __all__ = [
-    "validate_onnx_file",
-    "check_load_model",
     "extract_node_id",
     "get_node_by_id",
     "get_nodes_by_input_id",
@@ -71,42 +69,11 @@ __all__ = [
     "get_kernel_shape",
     "calculate_flops",
     "get_quantize_parent_for_dequantize_node",
+    "get_tensor_shape",
     "get_tensor_dim_shape",
     "set_tensor_dim_shape",
+    "override_model_input_shape",
 ]
-
-
-def validate_onnx_file(path: str):
-    """
-    Validate that a file at a given path is a valid ONNX model
-
-    :param path: the path of the file to validate
-    :raise ValueError: if not a valid ONNX model
-    """
-    try:
-        onnx_model = check_load_model(path)
-
-        if not onnx_model.opset_import:
-            raise ValueError("could not parse opset_import")
-    except Exception as err:
-        raise ValueError("file at {} is not a valid onnx model: {}".format(path, err))
-
-
-def check_load_model(model: Union[str, ModelProto]) -> ModelProto:
-    """
-    Load an ONNX model from a given file path if supplied.
-    If already a model proto, then returns.
-
-    :param model: the model proto or path to the model ONNX file to check for loading
-    :return: the loaded ONNX ModelProto
-    """
-    if isinstance(model, ModelProto):
-        return model
-
-    if isinstance(model, str):
-        return onnx.load(clean_path(model))
-
-    raise ValueError("unknown type given for model: {}".format(model))
 
 
 def extract_node_id(node: NodeProto) -> str:
@@ -211,12 +178,11 @@ def get_numpy_dtype(tensor: onnx.TensorProto) -> Union[None, numpy.dtype]:
     """
     data_type_enum = tensor.type.tensor_type.elem_type  # type: int
     data_type = onnx.TensorProto.DataType.Name(data_type_enum).lower()  # type: str
+    if data_type == "float":
+        data_type = "float32"
 
     if hasattr(numpy, data_type):
-        dtype = getattr(numpy, data_type)
-        if dtype is numpy.float:  # default to float32
-            dtype = numpy.float32
-        return dtype
+        return getattr(numpy, data_type)
     return None
 
 
@@ -233,6 +199,7 @@ NodeShape = NamedTuple(
 )
 
 
+@require_onnxruntime()
 def extract_nodes_shapes_ort(model: ModelProto) -> Dict[str, List[List[int]]]:
     """
     Creates a modified model to expose intermediate outputs and runs an ONNX Runtime
@@ -241,6 +208,8 @@ def extract_nodes_shapes_ort(model: ModelProto) -> Dict[str, List[List[int]]]:
     :param model: an ONNX model
     :return: a list of NodeArg with their shape exposed
     """
+    import onnxruntime  # import protected by @require_onnxruntime()
+
     model_copy = deepcopy(model)
 
     for node in model_copy.graph.node:
@@ -251,7 +220,17 @@ def extract_nodes_shapes_ort(model: ModelProto) -> Dict[str, List[List[int]]]:
 
     sess_options = onnxruntime.SessionOptions()
     sess_options.log_severity_level = 3
-    sess = onnxruntime.InferenceSession(model_copy.SerializeToString(), sess_options)
+    providers = (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if onnxruntime.get_device() == "GPU"
+        else ["CPUExecutionProvider"]
+    )
+
+    sess = onnxruntime.InferenceSession(
+        model_copy.SerializeToString(),
+        sess_options=sess_options,
+        providers=providers,
+    )
 
     output_shapes = {}
     for node in sess.get_outputs() + sess.get_inputs():
@@ -782,7 +761,11 @@ def get_node_output_nodes(model: ModelProto, node: NodeProto) -> List[NodeProto]
     for output_id in get_node_outputs(model, node):
         nodes.extend(get_nodes_by_input_id(model, output_id))
 
-    return nodes
+    unique_nodes = []
+    for node in nodes:
+        if node not in unique_nodes:
+            unique_nodes.append(node)
+    return unique_nodes
 
 
 def is_prunable_node(model: ModelProto, node: NodeProto) -> bool:
@@ -890,7 +873,7 @@ def get_prunable_nodes(model: Union[str, ModelProto]) -> List[Any]:
     :param model: the model proto loaded from the ONNX file
     :return: a list of nodes from the model proto
     """
-    model = check_load_model(model)
+    model = load_model(model)
     prunable_nodes = []
 
     for node in model.graph.node:
@@ -926,7 +909,7 @@ def onnx_nodes_sparsities(
     :return: a tuple containing the overall sparsity measurement for the model,
         each conv or gemm node found in the model
     """
-    model = check_load_model(model)
+    model = load_model(model)
     node_inp_sparsities = OrderedDict()  # type: Dict[str, SparsityMeasurement]
     params_count = 0
     params_zero_count = 0
@@ -966,7 +949,7 @@ def model_inputs(model: Union[str, ModelProto]) -> List:
         to get the model inputs for
     :return: the input to the model
     """
-    model = check_load_model(model)
+    model = load_model(model)
     inputs_all = [node.name for node in model.graph.input]
     inputs_init = [node.name for node in model.graph.initializer]
     input_names = list(set(inputs_all) - set(inputs_init))
@@ -984,7 +967,7 @@ def model_outputs(model: Union[str, ModelProto]) -> List:
         to get the model outputs for
     :return: the output from the model
     """
-    model = check_load_model(model)
+    model = load_model(model)
     outputs = [node for node in model.graph.output]
 
     return outputs
@@ -1194,16 +1177,27 @@ def get_quantize_parent_for_dequantize_node(
     return curr_node
 
 
-def get_tensor_dim_shape(tensor: onnx.TensorProto, dim: int) -> int:
+def get_tensor_shape(tensor: onnx.TensorProto) -> List[int]:
+    """
+    :param tensor: ONNX tensor to get the shape of
+    :return: shape of the tensor as a list
+    """
+    return [dim.dim_value for dim in tensor.type.tensor_type.shape.dim]
+
+
+def get_tensor_dim_shape(tensor: onnx.TensorProto, dim: Union[int, str]) -> int:
     """
     :param tensor: ONNX tensor to get the shape of a dimension of
     :param dim: dimension index of the tensor to get the shape of
     :return: shape of the tensor at the given dimension
     """
-    return tensor.type.tensor_type.shape.dim[dim].dim_value
+    return (
+        tensor.type.tensor_type.shape.dim[dim].dim_value
+        or tensor.type.tensor_type.shape.dim[dim].dim_param
+    )
 
 
-def set_tensor_dim_shape(tensor: onnx.TensorProto, dim: int, value: int):
+def set_tensor_dim_shape(tensor: onnx.TensorProto, dim: int, value: Union[int, str]):
     """
     Sets the shape of the tensor at the given dimension to the given value
 
@@ -1211,4 +1205,29 @@ def set_tensor_dim_shape(tensor: onnx.TensorProto, dim: int, value: int):
     :param dim: dimension index of the tensor to modify the shape of
     :param value: new shape for the given dimension
     """
-    tensor.type.tensor_type.shape.dim[dim].dim_value = value
+    if isinstance(value, str):
+        tensor.type.tensor_type.shape.dim[dim].dim_param = value
+    else:
+        tensor.type.tensor_type.shape.dim[dim].dim_value = value
+
+
+def override_model_input_shape(model: Union[str, onnx.ModelProto], shape: List[int]):
+    """
+    Set the shape of the first input of the given model to the given shape.
+    If given a file, the file will be overwritten
+
+    :param model: ONNX model or model path to overrwrite
+    :param shape: shape as list of integers to override with. must match
+        existing dimensions
+    """
+    if not isinstance(model, onnx.ModelProto):
+        model_path = model
+        model = onnx.load(model)
+    else:
+        model_path = None
+
+    for dim, dim_size in enumerate(shape):
+        set_tensor_dim_shape(model.graph.input[0], dim, dim_size)
+
+    if model_path:
+        save_onnx(model, model_path)

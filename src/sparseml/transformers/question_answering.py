@@ -20,13 +20,11 @@
 """
 Fine-tuning the library models for question answering integrated with sparseml
 """
-
-# You can also adapt this script on your own question answering task.
-# Pointers for this are left as comments.
-
+import json
 import logging
 import os
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -40,24 +38,25 @@ from transformers import (
     EvalPrediction,
     HfArgumentParser,
     PreTrainedTokenizerFast,
-    TrainingArguments,
     default_data_collator,
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
-from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
+from sparseml.pytorch.utils.distributed import record
 from sparseml.transformers.sparsification import (
     QuestionAnsweringTrainer,
+    SparseAutoModel,
+    TrainingArguments,
     postprocess_qa_predictions,
 )
-from sparseml.transformers.utils import SparseAutoModel, get_shared_tokenizer_src
+from sparseml.transformers.sparsification.sparse_model import get_shared_tokenizer_src
 
 
-# Will error if the minimal version of Transformers is not installed. Remove at your
-# own risks.
-check_min_version("4.18.0.dev0")
+# You can also adapt this script on your own question answering task.
+# Pointers for this are left as comments.
+
 
 require_version(
     "datasets>=1.18.0",
@@ -89,10 +88,6 @@ class ModelArguments:
                 "huggingface.co/models"
             )
         }
-    )
-    distill_teacher: Optional[str] = field(
-        default=None,
-        metadata={"help": "Teacher model which needs to be a trained QA model"},
     )
     config_name: Optional[str] = field(
         default=None,
@@ -141,21 +136,6 @@ class DataTrainingArguments:
     Arguments pertaining to what data to input to our model for training and eval
     """
 
-    recipe: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Path to a SparseML sparsification recipe, see "
-                "https://github.com/neuralmagic/sparseml for more information"
-            )
-        },
-    )
-    recipe_args: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Recipe arguments to be overwritten",
-        },
-    )
     dataset_name: Optional[str] = field(
         default=None,
         metadata={
@@ -287,6 +267,10 @@ class DataTrainingArguments:
         default=False,
         metadata={"help": "Whether to apply recipe in a one shot manner."},
     )
+    num_export_samples: int = field(
+        default=0,
+        metadata={"help": "Number of samples (inputs/outputs) to export during eval."},
+    )
 
     def __post_init__(self):
         if (
@@ -319,8 +303,10 @@ class DataTrainingArguments:
                 ], "`test_file` should be a csv or a json file."
 
 
-def main():
-    # See all possible arguments in src/transformers/training_args.py
+@record
+def main(**kwargs):
+    # See all possible arguments in
+    # src/sparseml/transformers/sparsification/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
@@ -333,9 +319,10 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(
             json_file=os.path.abspath(sys.argv[1])
         )
-    else:
+    elif not kwargs:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
+    else:
+        model_args, data_args, training_args = parser.parse_dict(kwargs)
     # Setup logging
     log_level = training_args.get_process_log_level()
     _LOGGER.setLevel(log_level)
@@ -378,46 +365,6 @@ def main():
     # Set seed before initializing model.
     set_seed(training_args.seed)
 
-    # Get the datasets: you can either provide your own CSV/JSON/TXT training and
-    # evaluation files (see below)or just provide the name of one of the public
-    # datasets available on the hub at https://huggingface.co/datasets/
-    # (the dataset will be downloaded automatically from the datasets Hub).
-    #
-    # For CSV/JSON files, this script will use the column called 'text' or the
-    # first column if no column called
-    # 'text' is found. You can easily tweak this behavior (see below).
-    #
-    # In distributed training, the load_dataset function guarantee that
-    # only one local process can concurrently download the dataset.
-    if data_args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            cache_dir=model_args.cache_dir,
-        )
-    else:
-        data_files = {}
-        if data_args.train_file is not None:
-            data_files["train"] = data_args.train_file
-            extension = data_args.train_file.split(".")[-1]
-
-        if data_args.validation_file is not None:
-            data_files["validation"] = data_args.validation_file
-            extension = data_args.validation_file.split(".")[-1]
-        if data_args.test_file is not None:
-            data_files["test"] = data_args.test_file
-            extension = data_args.test_file.split(".")[-1]
-        raw_datasets = load_dataset(
-            extension,
-            data_files=data_files,
-            field="data",
-            cache_dir=model_args.cache_dir,
-        )
-    # See more about loading any type of standard or custom dataset
-    # (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
-
     # Load pretrained model and tokenizer
     #
     # Distributed training:
@@ -440,7 +387,7 @@ def main():
             "revision": model_args.model_revision,
             "use_auth_token": True if model_args.use_auth_token else None,
         },
-        teacher_name_or_path=model_args.distill_teacher,
+        teacher_name_or_path=training_args.distill_teacher,
         teacher_kwargs={
             "cache_dir": model_args.cache_dir,
             "use_auth_token": True if model_args.use_auth_token else None,
@@ -469,14 +416,216 @@ def main():
             "find the model types that meet this requirement"
         )
 
+    raw_datasets = _get_raw_dataset(data_args=data_args, cache_dir=model_args.cache_dir)
+    make_eval_dataset = training_args.do_eval or data_args.num_export_samples > 0
+    tokenized_datasets, examples = _get_tokenized_datasets_and_examples(
+        data_args=data_args,
+        raw_datasets=raw_datasets,
+        tokenizer=tokenizer,
+        make_eval_dataset=make_eval_dataset,
+        do_train=training_args.do_train,
+        do_predict=training_args.do_predict,
+        main_process_func=training_args.main_process_first,
+    )
+
+    train_dataset = tokenized_datasets.get("train")
+    eval_dataset, eval_examples = tokenized_datasets.get("validation"), examples.get(
+        "validation"
+    )
+    predict_dataset, predict_examples = tokenized_datasets.get("test"), examples.get(
+        "test"
+    )
+
+    # Data collator
+    # We have already padded to max length if the corresponding flag is True,
+    # otherwise we need to pad in the data collator.
+    data_collator = (
+        default_data_collator
+        if data_args.pad_to_max_length
+        else DataCollatorWithPadding(
+            tokenizer, pad_to_multiple_of=8 if training_args.fp16 else None
+        )
+    )
+    column_names = _get_column_names(
+        raw_datasets=raw_datasets,
+        make_eval_dataset=make_eval_dataset,
+        do_train=training_args.do_train,
+    )
+    answer_column_name = "answers" if "answers" in column_names else column_names[2]
+
+    # Post-processing:
+    def post_processing_function(examples, features, predictions, stage="eval"):
+        # Post-processing: we match the start logits and end
+        # logits to answers in the original context.
+        predictions = postprocess_qa_predictions(
+            examples=examples,
+            features=features,
+            predictions=predictions,
+            version_2_with_negative=data_args.version_2_with_negative,
+            n_best_size=data_args.n_best_size,
+            max_answer_length=data_args.max_answer_length,
+            null_score_diff_threshold=data_args.null_score_diff_threshold,
+            output_dir=training_args.output_dir,
+            log_level=log_level,
+            prefix=stage,
+        )
+        # Format the result to the format the metric expects.
+        if data_args.version_2_with_negative:
+            formatted_predictions = [
+                {"id": k, "prediction_text": v, "no_answer_probability": 0.0}
+                for k, v in predictions.items()
+            ]
+        else:
+            formatted_predictions = [
+                {"id": k, "prediction_text": v} for k, v in predictions.items()
+            ]
+
+        references = [
+            {"id": ex["id"], "answers": ex[answer_column_name]} for ex in examples
+        ]
+        return EvalPrediction(predictions=formatted_predictions, label_ids=references)
+
+    metric = load_metric("squad_v2" if data_args.version_2_with_negative else "squad")
+
+    def compute_metrics(p: EvalPrediction):
+        return metric.compute(predictions=p.predictions, references=p.label_ids)
+
+    # Initialize our Trainer
+    trainer = QuestionAnsweringTrainer(
+        model=model,
+        model_state_path=model_args.model_name_or_path,
+        recipe=training_args.recipe,
+        recipe_args=training_args.recipe_args,
+        metadata_args=metadata_args,
+        teacher=teacher,
+        args=training_args,
+        data_args=data_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if make_eval_dataset else None,
+        eval_examples=eval_examples if training_args.do_eval else None,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        post_process_function=post_processing_function,
+        compute_metrics=compute_metrics,
+    )
+
+    # Training
+    if training_args.do_train:
+        checkpoint = None
+        if training_args.resume_from_checkpoint is not None:
+            checkpoint = training_args.resume_from_checkpoint
+        elif last_checkpoint is not None:
+            checkpoint = last_checkpoint
+        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        if not trainer.one_shot:
+            metrics = train_result.metrics
+            max_train_samples = (
+                data_args.max_train_samples
+                if data_args.max_train_samples is not None
+                else len(train_dataset)
+            )
+            metrics["train_samples"] = min(max_train_samples, len(train_dataset))
+            trainer.log_metrics("train", metrics)
+            trainer.save_metrics("train", metrics)
+        trainer.save_model()  # Saves the tokenizer too for easy upload
+        trainer.save_state()
+        trainer.save_optimizer_and_scheduler(training_args.output_dir)
+
+    # Evaluation
+    if training_args.do_eval and not trainer.one_shot:
+        _LOGGER.info("*** Evaluate ***")
+        metrics = trainer.evaluate()
+
+        max_eval_samples = (
+            data_args.max_eval_samples
+            if data_args.max_eval_samples is not None
+            else len(eval_dataset)
+        )
+        metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+
+    # Prediction
+    if training_args.do_predict and not trainer.one_shot:
+        _LOGGER.info("*** Predict ***")
+        results = trainer.predict(predict_dataset, predict_examples)
+        metrics = results.metrics
+
+        max_predict_samples = (
+            data_args.max_predict_samples
+            if data_args.max_predict_samples is not None
+            else len(predict_dataset)
+        )
+        metrics["predict_samples"] = min(max_predict_samples, len(predict_dataset))
+
+        trainer.log_metrics("predict", metrics)
+        trainer.save_metrics("predict", metrics)
+
+    kwargs = {
+        "finetuned_from": model_args.model_name_or_path,
+        "tasks": "question-answering",
+    }
+    if data_args.dataset_name is not None:
+        kwargs["dataset_tags"] = data_args.dataset_name
+        if data_args.dataset_config_name is not None:
+            kwargs["dataset_args"] = data_args.dataset_config_name
+            kwargs[
+                "dataset"
+            ] = f"{data_args.dataset_name} {data_args.dataset_config_name}"
+        else:
+            kwargs["dataset"] = data_args.dataset_name
+
+    # Exporting Samples
+
+    if data_args.num_export_samples > 0:
+        trainer.save_sample_inputs_outputs(
+            num_samples_to_export=data_args.num_export_samples
+        )
+
+
+def get_tokenized_qa_dataset(
+    data_args: DataTrainingArguments,
+    tokenizer: transformers.PreTrainedTokenizerBase,
+    cache_dir: Optional[str] = None,
+):
+    """
+    Utility method to get tokenized question answering dataset given at-least
+    the tokenizer, and data_arguments
+    :param data_args: Arguments pertaining to what data we are going to input
+        our model for training and eval
+    :param tokenizer: The tokenizer to use for tokenizing raw dataset
+    :param cache_dir: Local path to store the pretrained data from huggingface.co
+    """
+    raw_datasets = _get_raw_dataset(data_args=data_args, cache_dir=cache_dir)
+    tokenized_datasets, _ = _get_tokenized_datasets_and_examples(
+        data_args=data_args,
+        raw_datasets=raw_datasets,
+        tokenizer=tokenizer,
+        make_eval_dataset=True,
+    )
+    return tokenized_datasets
+
+
+def _get_tokenized_datasets_and_examples(
+    data_args,
+    raw_datasets,
+    tokenizer,
+    make_eval_dataset: bool = False,
+    do_train: bool = False,
+    do_predict: bool = False,
+    main_process_func=None,
+):
+    if main_process_func is None:
+        main_process_func = lambda desc: nullcontext(desc)  # noqa: E731
+
     # Preprocessing the datasets.
     # Preprocessing is slighlty different for training and evaluation.
-    if training_args.do_train:
-        column_names = raw_datasets["train"].column_names
-    elif training_args.do_eval:
-        column_names = raw_datasets["validation"].column_names
-    else:
-        column_names = raw_datasets["test"].column_names
+    column_names = _get_column_names(
+        raw_datasets=raw_datasets,
+        make_eval_dataset=make_eval_dataset,
+        do_train=do_train,
+    )
     question_column_name = "question" if "question" in column_names else column_names[0]
     context_column_name = "context" if "context" in column_names else column_names[1]
     answer_column_name = "answers" if "answers" in column_names else column_names[2]
@@ -586,7 +735,8 @@ def main():
 
         return tokenized_examples
 
-    if training_args.do_train:
+    train_dataset = eval_dataset = predict_dataset = None
+    if do_train:
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = raw_datasets["train"]
@@ -594,7 +744,7 @@ def main():
             # We will select sample from whole data if argument is specified
             train_dataset = train_dataset.select(range(data_args.max_train_samples))
         # Create train feature from dataset
-        with training_args.main_process_first(desc="train dataset map pre-processing"):
+        with main_process_func(desc="train dataset map pre-processing"):
             train_dataset = train_dataset.map(
                 prepare_train_features,
                 batched=True,
@@ -662,7 +812,8 @@ def main():
 
         return tokenized_examples
 
-    if training_args.do_eval:
+    eval_examples = None
+    if make_eval_dataset:
         if "validation" not in raw_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_examples = raw_datasets["validation"]
@@ -670,9 +821,7 @@ def main():
             # We will select sample from whole data
             eval_examples = eval_examples.select(range(data_args.max_eval_samples))
         # Validation Feature Creation
-        with training_args.main_process_first(
-            desc="validation dataset map pre-processing"
-        ):
+        with main_process_func(desc="validation dataset map pre-processing"):
             eval_dataset = eval_examples.map(
                 prepare_validation_features,
                 batched=True,
@@ -686,7 +835,8 @@ def main():
             # required samples again
             eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
 
-    if training_args.do_predict:
+    predict_examples = None
+    if do_predict:
         if "test" not in raw_datasets:
             raise ValueError("--do_predict requires a test dataset")
         predict_examples = raw_datasets["test"]
@@ -696,9 +846,7 @@ def main():
                 range(data_args.max_predict_samples)
             )
         # Predict Feature Creation
-        with training_args.main_process_first(
-            desc="prediction dataset map pre-processing"
-        ):
+        with main_process_func(desc="prediction dataset map pre-processing"):
             predict_dataset = predict_examples.map(
                 prepare_validation_features,
                 batched=True,
@@ -714,143 +862,79 @@ def main():
                 range(data_args.max_predict_samples)
             )
 
-    # Data collator
-    # We have already padded to max length if the corresponding flag is True,
-    # otherwise we need to pad in the data collator.
-    data_collator = (
-        default_data_collator
-        if data_args.pad_to_max_length
-        else DataCollatorWithPadding(
-            tokenizer, pad_to_multiple_of=8 if training_args.fp16 else None
-        )
-    )
-
-    # Post-processing:
-    def post_processing_function(examples, features, predictions, stage="eval"):
-        # Post-processing: we match the start logits and end
-        # logits to answers in the original context.
-        predictions = postprocess_qa_predictions(
-            examples=examples,
-            features=features,
-            predictions=predictions,
-            version_2_with_negative=data_args.version_2_with_negative,
-            n_best_size=data_args.n_best_size,
-            max_answer_length=data_args.max_answer_length,
-            null_score_diff_threshold=data_args.null_score_diff_threshold,
-            output_dir=training_args.output_dir,
-            log_level=log_level,
-            prefix=stage,
-        )
-        # Format the result to the format the metric expects.
-        if data_args.version_2_with_negative:
-            formatted_predictions = [
-                {"id": k, "prediction_text": v, "no_answer_probability": 0.0}
-                for k, v in predictions.items()
-            ]
-        else:
-            formatted_predictions = [
-                {"id": k, "prediction_text": v} for k, v in predictions.items()
-            ]
-
-        references = [
-            {"id": ex["id"], "answers": ex[answer_column_name]} for ex in examples
-        ]
-        return EvalPrediction(predictions=formatted_predictions, label_ids=references)
-
-    metric = load_metric("squad_v2" if data_args.version_2_with_negative else "squad")
-
-    def compute_metrics(p: EvalPrediction):
-        return metric.compute(predictions=p.predictions, references=p.label_ids)
-
-    # Initialize our Trainer
-    trainer = QuestionAnsweringTrainer(
-        model=model,
-        model_state_path=model_args.model_name_or_path,
-        recipe=data_args.recipe,
-        recipe_args=data_args.recipe_args,
-        metadata_args=metadata_args,
-        teacher=teacher,
-        args=training_args,
-        data_args=data_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        eval_examples=eval_examples if training_args.do_eval else None,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        post_process_function=post_processing_function,
-        compute_metrics=compute_metrics,
-    )
-
-    # Training
-    if training_args.do_train:
-        checkpoint = None
-        if training_args.resume_from_checkpoint is not None:
-            checkpoint = training_args.resume_from_checkpoint
-        elif last_checkpoint is not None:
-            checkpoint = last_checkpoint
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        if not trainer.one_shot:
-            metrics = train_result.metrics
-            max_train_samples = (
-                data_args.max_train_samples
-                if data_args.max_train_samples is not None
-                else len(train_dataset)
-            )
-            metrics["train_samples"] = min(max_train_samples, len(train_dataset))
-            trainer.log_metrics("train", metrics)
-            trainer.save_metrics("train", metrics)
-        trainer.save_model()  # Saves the tokenizer too for easy upload
-        trainer.save_state()
-
-    # Evaluation
-    if training_args.do_eval and not trainer.one_shot:
-        _LOGGER.info("*** Evaluate ***")
-        metrics = trainer.evaluate()
-
-        max_eval_samples = (
-            data_args.max_eval_samples
-            if data_args.max_eval_samples is not None
-            else len(eval_dataset)
-        )
-        metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
-
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
-
-    # Prediction
-    if training_args.do_predict and not trainer.one_shot:
-        _LOGGER.info("*** Predict ***")
-        results = trainer.predict(predict_dataset, predict_examples)
-        metrics = results.metrics
-
-        max_predict_samples = (
-            data_args.max_predict_samples
-            if data_args.max_predict_samples is not None
-            else len(predict_dataset)
-        )
-        metrics["predict_samples"] = min(max_predict_samples, len(predict_dataset))
-
-        trainer.log_metrics("predict", metrics)
-        trainer.save_metrics("predict", metrics)
-
-    kwargs = {
-        "finetuned_from": model_args.model_name_or_path,
-        "tasks": "question-answering",
+    tokenized_datasets = {
+        "train": train_dataset,
+        "validation": eval_dataset,
+        "test": predict_dataset,
     }
-    if data_args.dataset_name is not None:
-        kwargs["dataset_tags"] = data_args.dataset_name
-        if data_args.dataset_config_name is not None:
-            kwargs["dataset_args"] = data_args.dataset_config_name
-            kwargs[
-                "dataset"
-            ] = f"{data_args.dataset_name} {data_args.dataset_config_name}"
-        else:
-            kwargs["dataset"] = data_args.dataset_name
 
-    if training_args.push_to_hub:
-        trainer.push_to_hub(**kwargs)
+    examples = {"train": None, "validation": eval_examples, "test": predict_examples}
+    return tokenized_datasets, examples
+
+
+def _get_column_names(
+    raw_datasets, do_train: bool = False, make_eval_dataset: bool = False
+):
+    if do_train:
+        column_names = raw_datasets["train"].column_names
+    elif make_eval_dataset:
+        column_names = raw_datasets["validation"].column_names
     else:
-        trainer.create_model_card(**kwargs)
+        column_names = raw_datasets["test"].column_names
+    return column_names
+
+
+def _get_raw_dataset(data_args, cache_dir: Optional[str] = None):
+    # Get the datasets: you can either provide your own CSV/JSON/TXT training and
+    # evaluation files (see below)or just provide the name of one of the public
+    # datasets available on the hub at https://huggingface.co/datasets/
+    # (the dataset will be downloaded automatically from the datasets Hub).
+    #
+    # For CSV/JSON files, this script will use the column called 'text' or the
+    # first column if no column called
+    # 'text' is found. You can easily tweak this behavior (see below).
+    #
+    # In distributed training, the load_dataset function guarantee that
+    # only one local process can concurrently download the dataset.
+    if data_args.dataset_name is not None:
+        # Downloading and loading a dataset from the hub.
+        raw_datasets = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            cache_dir=cache_dir,
+        )
+    else:
+        data_files = {}
+        if data_args.train_file is not None:
+            data_files["train"] = data_args.train_file
+            extension = data_args.train_file.split(".")[-1]
+
+        if data_args.validation_file is not None:
+            data_files["validation"] = data_args.validation_file
+            extension = data_args.validation_file.split(".")[-1]
+        if data_args.test_file is not None:
+            data_files["test"] = data_args.test_file
+            extension = data_args.test_file.split(".")[-1]
+
+        try:
+            raw_datasets = load_dataset(
+                extension,
+                data_files=data_files,
+                field="data",
+                cache_dir=cache_dir,
+            )
+        except (json.JSONDecodeError, datasets.builder.DatasetGenerationError):
+            # run without `field="data"` - JSONL files will not always have each
+            # line nested under a top level field
+            raw_datasets = load_dataset(
+                extension,
+                data_files=data_files,
+                cache_dir=cache_dir,
+            )
+    # See more about loading any type of standard or custom dataset
+    # (from files, python dict, pandas DataFrame, etc) at
+    # https://huggingface.co/docs/datasets/loading_datasets.html.
+    return raw_datasets
 
 
 def _mp_fn(index):

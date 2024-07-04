@@ -21,20 +21,21 @@ Training and post-processing utilities for question answering.
 """
 
 import collections
-import inspect
 import json
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import datasets
 import numpy as np
 from torch.nn import Module
 from tqdm.auto import tqdm
-from transformers import Trainer, is_torch_tpu_available
+from transformers import is_torch_tpu_available
 from transformers.trainer_utils import PredictionOutput
 
-from sparseml.transformers.sparsification.trainer import TrainerInterface
+from sparseml.transformers.sparsification.trainer import (
+    TrainerInterface,
+    TransformersTrainer,
+)
 
 
 if is_torch_tpu_available():
@@ -51,12 +52,18 @@ __all__ = [
 _LOGGER = logging.getLogger(__name__)
 
 
-class _QuestionAnsweringTrainer(Trainer):
+class _QuestionAnsweringTrainer(TransformersTrainer):
     """
     Trainer implementation for Question-Answering processing
     """
 
-    def __init__(self, *args, eval_examples=None, post_process_function=None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        eval_examples=None,
+        post_process_function=None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.eval_examples = eval_examples
         self.post_process_function = post_process_function
@@ -116,6 +123,7 @@ class _QuestionAnsweringTrainer(Trainer):
         self.control = self.callback_handler.on_evaluate(
             self.args, self.state, self.control, metrics
         )
+
         return metrics
 
     def predict(
@@ -209,30 +217,6 @@ class QuestionAnsweringTrainer(TrainerInterface, _QuestionAnsweringTrainer):
             teacher=teacher,
             **kwargs,
         )
-
-    def _remove_unused_columns(
-        self, dataset: "datasets.Dataset", description: Optional[str] = None
-    ):
-        if (
-            self._signature_columns is None
-            and self.teacher is not None
-            and self.teacher not in ("disable", "self")
-        ):
-            model_signature = inspect.signature(self.model.forward)
-            model_signature_columns = set(model_signature.parameters.keys())
-
-            teacher_signature = inspect.signature(self.teacher.forward)
-            teacher_signature_columns = set(teacher_signature.parameters.keys())
-
-            self._signature_columns = list(
-                model_signature_columns | teacher_signature_columns
-            )
-
-            # Labels may be named label or label_ids, the default data
-            # collator handles that.
-            self._signature_columns += ["label", "label_ids"]
-
-        return super()._remove_unused_columns(dataset, description)
 
 
 def postprocess_qa_predictions(

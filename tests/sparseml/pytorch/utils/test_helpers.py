@@ -25,14 +25,15 @@ from torch.nn import BatchNorm2d, Conv2d, Linear, Module, ReLU, Sequential
 from torch.optim import SGD
 from torch.utils.data import DataLoader
 
-from flaky import flaky
 from sparseml.pytorch.datasets import RandNDataset
 from sparseml.pytorch.utils import (
+    MEMORY_BOUNDED,
     default_device,
     early_stop_data_loader,
     get_optim_learning_rate,
     infinite_data_loader,
     mask_difference,
+    memory_aware_threshold,
     set_optim_learning_rate,
     tensor_density,
     tensor_export,
@@ -556,6 +557,7 @@ def test_tensor_export_npy(tensor, name):
 
     for s1, s2 in zip(exported.shape, tensor.shape):
         assert s1 == s2
+    os.remove(path)
 
 
 @pytest.mark.skipif(
@@ -577,6 +579,7 @@ def test_tensor_export_npz(tensor, name):
 
     for s1, s2 in zip(exported.shape, tensor.shape):
         assert s1 == s2
+    os.remove(path)
 
 
 @pytest.mark.skipif(
@@ -600,6 +603,7 @@ def test_tensor_export_cuda(tensor, name):
 
     for s1, s2 in zip(exported.shape, tensor.shape):
         assert s1 == s2
+    os.remove(path)
 
 
 @pytest.mark.skipif(
@@ -625,9 +629,10 @@ def test_tensors_export(tensors, name):
         exported = numpy.load(path)
         exported = exported[exported.files[0]]
         assert numpy.sum(exported.shape) > 1
+        os.remove(path)
 
 
-@flaky(max_runs=2, min_passes=1)
+@pytest.mark.flaky(reruns=2, min_passes=1)
 @pytest.mark.skipif(
     os.getenv("NM_ML_SKIP_PYTORCH_TESTS", False),
     reason="Skipping pytorch tests",
@@ -666,7 +671,7 @@ def test_tensor_sparsity(tensor, dim, expected_sparsity):
     assert torch.sum((sparsity - expected_sparsity).abs()) < 0.001
 
 
-@flaky(max_runs=2, min_passes=1)
+@pytest.mark.flaky(reruns=2, min_passes=1)
 @pytest.mark.skipif(
     os.getenv("NM_ML_SKIP_PYTORCH_TESTS", False),
     reason="Skipping pytorch tests",
@@ -698,7 +703,7 @@ def test_tensor_sparsity_cuda(tensor, dim, expected_sparsity):
     assert torch.sum((sparsity.detach().cpu() - expected_sparsity).abs()) < 0.001
 
 
-@flaky(max_runs=2, min_passes=1)
+@pytest.mark.flaky(reruns=2, min_passes=1)
 @pytest.mark.skipif(
     os.getenv("NM_ML_SKIP_PYTORCH_TESTS", False),
     reason="Skipping pytorch tests",
@@ -737,7 +742,7 @@ def test_tensor_density(tensor, dim, expected_density):
     assert torch.sum((density - expected_density).abs()) < 0.001
 
 
-@flaky(max_runs=2, min_passes=1)
+@pytest.mark.flaky(reruns=2, min_passes=1)
 @pytest.mark.skipif(
     os.getenv("NM_ML_SKIP_PYTORCH_TESTS", False),
     reason="Skipping pytorch tests",
@@ -880,3 +885,28 @@ def test_thin_model_from_checkpoint(model, state_dict, test_input):
     thin_model_from_checkpoint(model, state_dict)
     model.load_state_dict(state_dict, strict=True)
     assert isinstance(model(test_input), Tensor)
+
+
+@pytest.mark.parametrize(
+    "tensor,idx",
+    [
+        (torch.rand(1), 0),
+        (torch.rand(1_000), 123),
+        (torch.rand(10_000), 4321),
+        (torch.rand(100_000), 12345),
+    ],
+)
+def test_memory_aware_threshold(tensor, idx):
+    prior_state = os.getenv(MEMORY_BOUNDED)
+
+    dev = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    tensor = tensor.to(dev)
+
+    os.environ[MEMORY_BOUNDED] = "True"
+    t1 = memory_aware_threshold(tensor, idx)
+    os.environ[MEMORY_BOUNDED] = "False"
+    t2 = memory_aware_threshold(tensor, idx)
+    assert abs(t1 - t2) < 1e-3
+
+    if prior_state is not None:
+        os.environ[MEMORY_BOUNDED] = prior_state
